@@ -102,3 +102,40 @@ def test_wrong_init_stage_is_rejected(tmp_path):
     with pytest.raises(RuntimeError, match="diagonal_pretrain"):
         initialize_or_resume(stage2, *objects()[:1], None, *objects()[1:])
 
+
+def test_joint_resume_is_complete_and_rejects_other_stages(tmp_path):
+    joint = load_config(ROOT / "configs" / "joint_ecld_cityscapes.yaml")
+    joint["training"]["batch_size"] = 2
+    model, optimizer, scheduler, scaler = objects()
+    model(torch.ones(1, 3)).sum().backward()
+    optimizer.step()
+    scheduler.step()
+    payload = checkpoint_payload(
+        config=joint, epoch=4, global_step=13, model=model, source_model=None,
+        optimizer=optimizer, scheduler=scheduler, scaler=scaler,
+        metrics={"best_mIoU": 0.6},
+    )
+    resume_path = save_checkpoint(payload, tmp_path, "joint.pt")
+    joint["checkpoint"]["resume"] = str(resume_path)
+
+    restored_model, restored_optimizer, restored_scheduler, restored_scaler = objects()
+    state = initialize_or_resume(
+        joint, restored_model, None, restored_optimizer, restored_scheduler,
+        restored_scaler,
+    )
+    torch.testing.assert_close(restored_model.weight, model.weight)
+    assert state.start_epoch == 4
+    assert state.global_step == 13
+    assert state.best_miou == 0.6
+    assert restored_optimizer.state
+
+    incompatible = dict(payload)
+    incompatible["stage"] = "diagonal_pretrain"
+    incompatible_path = tmp_path / "stage1-as-joint.pt"
+    torch.save(incompatible, incompatible_path)
+    joint["checkpoint"]["resume"] = str(incompatible_path)
+    with pytest.raises(RuntimeError, match="Resume stage mismatch"):
+        initialize_or_resume(
+            joint, restored_model, None, restored_optimizer, restored_scheduler,
+            restored_scaler,
+        )

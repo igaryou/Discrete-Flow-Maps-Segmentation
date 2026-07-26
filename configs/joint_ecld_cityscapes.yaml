@@ -1,0 +1,11 @@
+extends: stage2_ecld_cityscapes.yaml
+experiment:
+  name: dfm_joint_ecld_cityscapes
+  output_dir: /home/igarashi_25/playground_2/CSDFM/DFM/results/joint_ecld
+  stage: joint_training
+checkpoint:
+  init_from: null
+  resume: null
+wandb:
+  name: dfm-joint-ecld-256x512
+  tags: [cityscapes, joint, ecld]

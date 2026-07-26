@@ -6,15 +6,23 @@ import torch
 class SegmentationMetrics:
     """20-way confusion matrix; GT void is filtered, predicted void is retained."""
 
-    def __init__(self, num_classes: int = 20, void_class_index: int = 19) -> None:
+    def __init__(
+        self,
+        num_classes: int = 20,
+        void_class_index: int = 19,
+        device: torch.device | str = "cpu",
+    ) -> None:
         self.num_classes = num_classes
         self.void_class_index = void_class_index
-        self.confusion_matrix = torch.zeros(num_classes, num_classes, dtype=torch.int64)
+        self.confusion_matrix = torch.zeros(
+            num_classes, num_classes, dtype=torch.int64, device=device
+        )
 
     @torch.no_grad()
     def update(self, prediction: torch.Tensor, target: torch.Tensor) -> None:
-        prediction = prediction.detach().reshape(-1).cpu()
-        target = target.detach().reshape(-1).cpu()
+        device = self.confusion_matrix.device
+        prediction = prediction.detach().reshape(-1).to(device)
+        target = target.detach().reshape(-1).to(device)
         valid = (
             (target >= 0) & (target < self.num_classes)
             & (target != self.void_class_index)
@@ -40,7 +48,7 @@ class SegmentationMetrics:
             "mAcc": float(class_accuracy[evaluated].mean()),
             "class_iou": [float(value) for value in iou[evaluated]],
             "class_accuracy": [float(value) for value in class_accuracy[evaluated]],
-            "confusion_matrix": self.confusion_matrix.tolist(),
+            "confusion_matrix": self.confusion_matrix.cpu().tolist(),
             "evaluated_class_indices": torch.arange(self.num_classes)[evaluated].tolist(),
             "void_gt_excluded": self.void_class_index,
             "prediction_void_retained": True,

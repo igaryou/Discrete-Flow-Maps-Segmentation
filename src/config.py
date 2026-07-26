@@ -23,6 +23,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "deterministic": False,
         "config_path": None,
     },
+    "distributed": {
+        "enabled": "auto",
+        "backend": "nccl",
+        "init_method": "env://",
+        "find_unused_parameters": False,
+        "broadcast_buffers": False,
+        "gradient_as_bucket_view": True,
+    },
     "dataset": {
         "name": "cityscapes",
         "root": "",
@@ -128,6 +136,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "warmup_epochs": 0,
             "schedule": "linear",
             "max_weight": 1.0,
+            "precision": {
+                "jvp_dtype": "bf16",
+                "numerical_dtype": "fp32",
+                "debug_assertions": False,
+            },
+            "psd": {},
+            "csd": {},
+            "ecld": {
+                "ec_weight": 4.0,
+                "td_weight": 2.0,
+                "time_weighting": "none",
+            },
             "adaptive_kl": {
                 "enabled": False,
                 "c": 1.0e-6,
@@ -169,7 +189,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
 }
 
-REQUIRED_SECTIONS = tuple(DEFAULT_CONFIG)
+# `distributed` was added after the original YAML format. Let older single-GPU
+# configs inherit its safe defaults instead of breaking config compatibility.
+REQUIRED_SECTIONS = tuple(
+    section for section in DEFAULT_CONFIG if section != "distributed"
+)
 REQUIRED_KEYS = (
     "experiment.name",
     "experiment.output_dir",
@@ -233,8 +257,14 @@ def _validate_required(raw: dict[str, Any]) -> None:
 
 def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     stage = select(config, "experiment.stage")
-    if stage not in {"diagonal_pretrain", "esd_distillation"}:
-        raise ValueError("experiment.stage must be diagonal_pretrain or esd_distillation")
+    valid_stages = {
+        "diagonal_pretrain",
+        "consistency_distillation",
+        "esd_distillation",
+        "joint_training",
+    }
+    if stage not in valid_stages:
+        raise ValueError(f"experiment.stage must be one of {sorted(valid_stages)}")
     if config["dataset"]["name"] != "cityscapes":
         raise ValueError("Only dataset.name=cityscapes is supported")
     if config["dataset"]["num_classes"] != 20 or config["model"]["num_classes"] != 20:
@@ -249,6 +279,13 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("dataset.crop_size must be null or [height, width]")
     if config["runtime"]["amp_dtype"] not in {"bf16", "fp16"}:
         raise ValueError("runtime.amp_dtype must be bf16 or fp16")
+    distributed = config["distributed"]
+    if distributed["enabled"] not in {"auto", True, False}:
+        raise ValueError("distributed.enabled must be auto, true, or false")
+    if distributed["backend"] not in {"nccl", "gloo"}:
+        raise ValueError("distributed.backend must be nccl or gloo")
+    if distributed["init_method"] != "env://":
+        raise ValueError("distributed.init_method currently supports only env://")
     if config["model"]["backbone"] != "unet":
         raise ValueError("This DFM implementation currently supports model.backbone=unet")
     if config["source"]["prior_type"] not in {"gaussian", "dirichlet", "image_gaussian"}:
@@ -270,15 +307,45 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     if config["checkpoint"]["init_from"] and config["checkpoint"]["resume"]:
         raise ValueError("checkpoint.init_from and checkpoint.resume are mutually exclusive")
     consistency = config["loss"]["consistency"]
+    if consistency["type"] not in {"psd", "csd", "ecld", "esd"}:
+        raise ValueError("loss.consistency.type must be psd, csd, ecld, or esd")
     if consistency["schedule"] != "linear":
         raise ValueError("loss.consistency.schedule currently supports only linear")
+    precision = consistency["precision"]
+    if precision["numerical_dtype"] != "fp32":
+        raise ValueError("loss.consistency.precision.numerical_dtype must be fp32")
+    if consistency["type"] == "psd":
+        if precision["jvp_dtype"] is not None:
+            raise ValueError("PSD does not use JVP; precision.jvp_dtype must be null")
+    elif precision["jvp_dtype"] not in {"bf16", "fp32"}:
+        raise ValueError("precision.jvp_dtype must be bf16 or fp32")
+    if (
+        consistency["enabled"]
+        and precision["jvp_dtype"] == "bf16"
+        and (
+            not config["runtime"]["amp"]
+            or config["runtime"]["amp_dtype"] != "bf16"
+        )
+    ):
+        raise ValueError(
+            "bf16 JVP requires runtime.amp=true and runtime.amp_dtype=bf16"
+        )
+    if consistency["ecld"]["time_weighting"] not in {"none", "inverse_square"}:
+        raise ValueError("ECLD time_weighting must be none or inverse_square")
     if stage == "diagonal_pretrain" and consistency["enabled"]:
         raise ValueError("Stage 1 must not enable a consistency loss")
-    if stage == "esd_distillation":
-        if not consistency["enabled"] or consistency["type"] != "esd":
-            raise ValueError("Stage 2 requires loss.consistency.enabled=true and type=esd")
+    if stage in {"consistency_distillation", "esd_distillation"}:
+        if not consistency["enabled"]:
+            raise ValueError("Stage 2 requires loss.consistency.enabled=true")
+        if stage == "esd_distillation" and consistency["type"] != "esd":
+            raise ValueError("Legacy esd_distillation stage requires consistency.type=esd")
         if not config["checkpoint"]["init_from"] and not config["checkpoint"]["resume"]:
             raise ValueError("Stage 2 requires checkpoint.init_from or checkpoint.resume")
+    if stage == "joint_training":
+        if not consistency["enabled"]:
+            raise ValueError("joint_training requires consistency.enabled=true")
+        if config["checkpoint"]["init_from"]:
+            raise ValueError("joint_training forbids checkpoint.init_from")
     return config
 
 
@@ -300,12 +367,29 @@ def apply_overrides(config: dict[str, Any], overrides: Iterable[str]) -> dict[st
     return validate_config(result)
 
 
-def load_config(path: str | Path, overrides: Iterable[str] = ()) -> dict[str, Any]:
-    config_path = Path(path).expanduser().resolve()
-    with config_path.open("r", encoding="utf-8") as handle:
+def _load_raw_config(path: Path, seen: set[Path] | None = None) -> dict[str, Any]:
+    seen = set() if seen is None else seen
+    path = path.expanduser().resolve()
+    if path in seen:
+        raise ValueError(f"Recursive config extends detected: {path}")
+    seen.add(path)
+    with path.open("r", encoding="utf-8") as handle:
         raw = yaml.safe_load(handle)
     if not isinstance(raw, dict):
-        raise ValueError(f"YAML root must be a mapping: {config_path}")
+        raise ValueError(f"YAML root must be a mapping: {path}")
+    extends = raw.pop("extends", None)
+    if extends is not None:
+        base_path = Path(extends)
+        if not base_path.is_absolute():
+            base_path = path.parent / base_path
+        raw = _merge(_load_raw_config(base_path, seen), raw)
+    seen.remove(path)
+    return raw
+
+
+def load_config(path: str | Path, overrides: Iterable[str] = ()) -> dict[str, Any]:
+    config_path = Path(path).expanduser().resolve()
+    raw = _load_raw_config(config_path)
     _validate_required(raw)
     _check_unknown(raw, DEFAULT_CONFIG)
     config = _merge(DEFAULT_CONFIG, _expand(raw))

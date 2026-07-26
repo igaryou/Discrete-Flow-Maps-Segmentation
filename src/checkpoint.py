@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import copy
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
+from torch.nn.parallel import DistributedDataParallel
 
 
 @dataclass
@@ -41,20 +43,33 @@ def checkpoint_payload(
     scheduler,
     scaler,
     metrics: dict,
+    distributed: dict | None = None,
 ) -> dict:
-    raw_model = getattr(model, "_orig_mod", model)
+    raw_model = model
+    while isinstance(raw_model, DistributedDataParallel):
+        raw_model = raw_model.module
+    raw_model = getattr(raw_model, "_orig_mod", raw_model)
+    raw_source = source_model
+    while isinstance(raw_source, DistributedDataParallel):
+        raw_source = raw_source.module
+    raw_source = getattr(raw_source, "_orig_mod", raw_source)
     return {
         "stage": config["experiment"]["stage"],
         "epoch": epoch,
         "global_step": global_step,
         "model": raw_model.state_dict(),
-        "source_model": source_model.state_dict() if source_model is not None else None,
+        "source_model": raw_source.state_dict() if raw_source is not None else None,
         "optimizer": optimizer.state_dict() if optimizer is not None else None,
         "scheduler": scheduler.state_dict() if scheduler is not None else None,
         "scaler": scaler.state_dict() if scaler is not None else None,
         "config": copy.deepcopy(config),
         "model_signature": model_signature(config),
         "metrics": copy.deepcopy(metrics),
+        "distributed": copy.deepcopy(distributed or {
+            "world_size": 1,
+            "global_batch_size": config["training"]["batch_size"],
+            "local_batch_size": config["training"]["batch_size"],
+        }),
     }
 
 
@@ -85,6 +100,26 @@ def _validate_stage1_checkpoint(checkpoint: dict, config: dict, path: str | Path
         )
 
 
+def _without_module_prefix(state_dict: dict) -> dict:
+    if state_dict and all(key.startswith("module.") for key in state_dict):
+        return {key.removeprefix("module."): value for key, value in state_dict.items()}
+    return state_dict
+
+
+def _resume_stage_compatible(checkpoint: dict, config: dict) -> bool:
+    saved_stage = checkpoint.get("stage")
+    current_stage = config["experiment"]["stage"]
+    if saved_stage == current_stage:
+        return True
+    consistency_type = config["loss"]["consistency"]["type"]
+    stage2_names = {"consistency_distillation", "esd_distillation"}
+    return (
+        saved_stage in stage2_names
+        and current_stage in stage2_names
+        and consistency_type == "esd"
+    )
+
+
 def initialize_or_resume(
     config: dict,
     model,
@@ -103,12 +138,14 @@ def initialize_or_resume(
     if init_from:
         checkpoint = torch.load(init_from, map_location="cpu", weights_only=False)
         _validate_stage1_checkpoint(checkpoint, config, init_from)
-        model.load_state_dict(checkpoint["model"], strict=strict)
+        model.load_state_dict(_without_module_prefix(checkpoint["model"]), strict=strict)
         saved_source = checkpoint.get("source_model")
         if source_model is not None:
             if saved_source is None:
                 raise RuntimeError("Stage 1 checkpoint has no source_model state")
-            source_model.load_state_dict(saved_source, strict=strict)
+            source_model.load_state_dict(
+                _without_module_prefix(saved_source), strict=strict
+            )
         metrics = checkpoint.get("metrics", {})
         best = metrics.get("best_mIoU", metrics.get("mIoU", float("-inf")))
         lines = (
@@ -118,23 +155,27 @@ def initialize_or_resume(
             "Starting Stage 2 from epoch 1",
             "Optimizer state: newly initialized",
             "Scheduler state: newly initialized",
-            f"ESD enabled: {str(config['loss']['consistency']['enabled']).lower()}",
+            f"Consistency loss: {config['loss']['consistency']['type']}",
+            f"ESD enabled: {str(config['loss']['consistency']['type'] == 'esd').lower()}",
         )
-        for line in lines:
-            logger.info(line) if logger is not None else print(line)
+        if logger is not None:
+            for line in lines:
+                logger.info(line)
         return TrainingState()
     if resume:
         checkpoint = torch.load(resume, map_location="cpu", weights_only=False)
-        if checkpoint.get("stage") != config["experiment"]["stage"]:
+        if not _resume_stage_compatible(checkpoint, config):
             raise RuntimeError(
                 f"Resume stage mismatch: checkpoint={checkpoint.get('stage')} "
                 f"config={config['experiment']['stage']}"
             )
-        model.load_state_dict(checkpoint["model"], strict=strict)
+        model.load_state_dict(_without_module_prefix(checkpoint["model"]), strict=strict)
         if source_model is not None:
             if checkpoint.get("source_model") is None:
                 raise RuntimeError("Resume checkpoint has no source_model state")
-            source_model.load_state_dict(checkpoint["source_model"], strict=strict)
+            source_model.load_state_dict(
+                _without_module_prefix(checkpoint["source_model"]), strict=strict
+            )
         # A resume is deliberately a complete continuation. The load_* fields are
         # relevant to legacy/import workflows, but may not weaken resume semantics.
         if checkpoint.get("optimizer") is None or checkpoint.get("scheduler") is None:
@@ -143,6 +184,18 @@ def initialize_or_resume(
         scheduler.load_state_dict(checkpoint["scheduler"])
         if scaler is not None and checkpoint.get("scaler") is not None:
             scaler.load_state_dict(checkpoint["scaler"])
+        saved_distributed = checkpoint.get("distributed", {})
+        saved_global_batch = saved_distributed.get("global_batch_size")
+        current_global_batch = config["training"]["batch_size"]
+        if (
+            saved_global_batch is not None
+            and saved_global_batch != current_global_batch
+        ):
+            warnings.warn(
+                "Resuming with a changed global batch size: "
+                f"checkpoint={saved_global_batch}, current={current_global_batch}",
+                RuntimeWarning,
+            )
         metrics = checkpoint.get("metrics", {})
         if logger is not None:
             logger.info(

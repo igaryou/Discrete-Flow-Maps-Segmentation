@@ -1,0 +1,10 @@
+extends: stage2_esd_cityscapes.yaml
+experiment:
+  name: dfm_cityscapes_stage2_csd
+  output_dir: /home/igarashi_25/playground_2/CSDFM/DFM/results/stage2_csd
+loss:
+  consistency:
+    type: csd
+wandb:
+  name: dfm-stage2-csd-256x512
+  tags: [cityscapes, stage2, csd]

@@ -2,13 +2,20 @@ experiment:
   name: dfm_debug_stage2
   seed: 42
   output_dir: /home/igarashi_25/playground_2/CSDFM/DFM/results/debug_stage2
-  stage: esd_distillation
+  stage: consistency_distillation
 runtime:
   device: auto
   amp: true
   amp_dtype: bf16
   compile: false
   deterministic: false
+distributed:
+  enabled: auto
+  backend: nccl
+  init_method: env://
+  find_unused_parameters: false
+  broadcast_buffers: false
+  gradient_as_bucket_view: true
 dataset:
   name: cityscapes
   root: /home/igarashi_25/datasets/cityscapes
@@ -96,6 +103,10 @@ loss:
     warmup_epochs: 0
     schedule: linear
     max_weight: 1.0
+    precision: {jvp_dtype: bf16, numerical_dtype: fp32, debug_assertions: true}
+    psd: {}
+    csd: {}
+    ecld: {ec_weight: 4.0, td_weight: 2.0, time_weighting: none}
     adaptive_kl:
       enabled: true
       c: 1.0e-6

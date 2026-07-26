@@ -57,3 +57,33 @@ def test_init_from_and_resume_are_mutually_exclusive(tmp_path):
     with pytest.raises(ValueError, match="mutually exclusive"):
         load_config(path)
 
+
+def test_precision_validation_rejects_fake_psd_jvp_and_bf16_numerics():
+    with pytest.raises(ValueError, match="PSD does not use JVP"):
+        load_config(
+            Path(__file__).parents[1] / "configs" / "debug_ddp_stage2_psd.yaml",
+            ["loss.consistency.precision.jvp_dtype=bf16"],
+        )
+    with pytest.raises(ValueError, match="numerical_dtype must be fp32"):
+        load_config(
+            Path(__file__).parents[1] / "configs" / "debug_ddp_stage2_ecld.yaml",
+            ["loss.consistency.precision.numerical_dtype=bf16"],
+        )
+
+
+def test_bf16_jvp_requires_runtime_bf16_amp():
+    with pytest.raises(ValueError, match="bf16 JVP requires"):
+        load_config(
+            Path(__file__).parents[1] / "configs" / "debug_ddp_stage2_esd.yaml",
+            ["runtime.amp=false"],
+        )
+
+
+def test_legacy_single_gpu_yaml_can_omit_distributed(tmp_path):
+    raw = yaml.safe_load(CONFIG.read_text())
+    del raw["distributed"]
+    path = tmp_path / "legacy.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    config = load_config(path)
+    assert config["distributed"]["enabled"] == "auto"
+    assert config["distributed"]["backend"] == "nccl"

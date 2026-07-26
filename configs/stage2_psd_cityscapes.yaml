@@ -1,0 +1,14 @@
+extends: stage2_esd_cityscapes.yaml
+experiment:
+  name: dfm_cityscapes_stage2_psd
+  output_dir: /home/igarashi_25/playground_2/CSDFM/DFM/results/stage2_psd
+loss:
+  consistency:
+    type: psd
+    precision:
+      jvp_dtype: null
+      numerical_dtype: fp32
+      debug_assertions: false
+wandb:
+  name: dfm-stage2-psd-256x512
+  tags: [cityscapes, stage2, psd]

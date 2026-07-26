@@ -1,0 +1,11 @@
+extends: stage2_csd_cityscapes.yaml
+experiment:
+  name: dfm_joint_csd_cityscapes
+  output_dir: /home/igarashi_25/playground_2/CSDFM/DFM/results/joint_csd
+  stage: joint_training
+checkpoint:
+  init_from: null
+  resume: null
+wandb:
+  name: dfm-joint-csd-256x512
+  tags: [cityscapes, joint, csd]

@@ -1,0 +1,11 @@
+extends: stage2_psd_cityscapes.yaml
+experiment:
+  name: dfm_joint_psd_cityscapes
+  output_dir: /home/igarashi_25/playground_2/CSDFM/DFM/results/joint_psd
+  stage: joint_training
+checkpoint:
+  init_from: null
+  resume: null
+wandb:
+  name: dfm-joint-psd-256x512
+  tags: [cityscapes, joint, psd]

@@ -1,0 +1,15 @@
+extends: stage2_esd_cityscapes.yaml
+experiment:
+  name: dfm_cityscapes_stage2_ecld
+  output_dir: /home/igarashi_25/playground_2/CSDFM/DFM/results/stage2_ecld
+loss:
+  consistency:
+    type: ecld
+    weight: 0.1
+    ecld:
+      ec_weight: 4.0
+      td_weight: 2.0
+      time_weighting: none
+wandb:
+  name: dfm-stage2-ecld-256x512
+  tags: [cityscapes, stage2, ecld]

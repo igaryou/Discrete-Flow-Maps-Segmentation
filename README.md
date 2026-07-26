@@ -1,223 +1,332 @@
 # Discrete Flow Maps for Cityscapes segmentation
 
-このディレクトリは、既存 `CFM/src/segv4` の Cityscapes データ処理、RRDB 条件
-エンコーダ、時間条件付き UNet、SegFormer Gaussian source、評価・可視化を
-DFM 用に独立移植した実装です。`CFM/src` は参照しただけで変更していません。
+Cityscapesの20-class意味的セグメンテーションをDiscrete Flow Maps（DFM）で
+学習する実装です。Stage 1対角事前学習、Stage 2整合性蒸留、事前学習なしの
+joint training、single GPU、単一ノードDDPに対応します。CFM実装は設計と数式の
+参照専用であり、変更していません。
 
-学習は別々のコマンドで動く 2 段階構成です。
+## 全体構成
 
-- Stage 1 (`diagonal_pretrain`) は対角 mean denoiser
-  \(\psi_{\theta,t,t}(x_t,I)\) だけを CE で学習します。ESD と JVP は呼びません。
-- Stage 2 (`esd_distillation`) は Stage 1 checkpoint のモデル/source 重みだけを
-  `init_from` で読み込み、対角 CE、ESD、source loss を組み合わせて epoch 1 から
-  新しく学習します。
+経路とmean-denoiser Flow Mapは次のとおりです。
 
-## セットアップ
+\[
+x_t=(1-t)x_0+t x_1,\qquad
+X^\theta_{s,t}(x_s)
+=x_s+\frac{t-s}{1-s}\left(\psi^\theta_{s,t}(x_s,I)-x_s\right).
+\]
 
-このワークスペースでは親ディレクトリの既存 `.venv` を再利用するため、そのまま
-`uv run` できます。新しい環境を作る場合は次を実行してください。
+`x_1`はvoidを含む20-class one-hotです。`x_0`は`source.prior_type`で
+`gaussian`、`dirichlet`、`image_gaussian`から選びます。
+`flow.time_eps`はFlow Mapの分母のゼロ除算防止にだけ使います。
 
-```bash
-uv sync --extra full
+学習方式は2つです。
+
+| 方式 | entrypoint | 初期値 | iterationの損失 |
+|---|---|---|---|
+| Stage 1 → Stage 2 | `src/train.py` | Stage 2はStage 1 checkpoint | Stage 1: 対角CEのみ、Stage 2: 対角CE + 1種類の整合性損失 + source |
+| joint | `src/train_joint.py` | endpointをランダム初期化 | epoch 1から対角CE + 1種類の整合性損失 + source |
+
+総損失はStage 2とjointで共通です。
+
+```text
+loss_total =
+    primary.weight * loss_diagonal
+  + consistency.weight * consistency.max_weight * schedule * loss_consistency
+  + source.var_weight * loss_source_var
+  + source.align_weight * loss_source_align
 ```
 
-依存バージョンは `pyproject.toml` と `uv.lock` に固定しています。
+`schedule`は`start_epoch`と`warmup_epochs`によるlinear warm-upです。
 
-## 実行
+### Stage 1
 
-Stage 1:
+`experiment.stage: diagonal_pretrain`を使います。モデル入力は
+`(x_t, image, s=t, t=t)`で、endpointの学習目的は対角CEだけです。既存の
+image-conditioned sourceを使う場合のsource regularizerは維持しますが、
+PSD/CSD/ECLD/ESDのdispatchにも`torch.func.jvp`にも入りません。この回帰条件は
+unit testでも禁止関数に置き換えて検証しています。
 
 ```bash
-cd /home/igarashi_25/playground_2/CSDFM/DFM
 CUDA_VISIBLE_DEVICES=0 \
 uv run python src/train.py \
   --config configs/stage1_diagonal_cityscapes.yaml
 ```
 
-Stage 2:
+### Stage 2
+
+`experiment.stage: consistency_distillation`を使い、`checkpoint.init_from`に
+Stage 1 checkpointを指定します。旧`esd_distillation`はESD checkpointの
+後方互換aliasとしてload/resume時も受理します。整合性損失は1 runにつき1種類で、
+`loss.consistency.type`を`psd`、`csd`、`ecld`、`esd`から選びます。
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+uv run python src/train.py \
+  --config configs/stage2_ecld_cityscapes.yaml
+```
+
+### Joint training（対角事前学習なし）
+
+`src/train_joint.py`と`experiment.stage: joint_training`を使います。
+`checkpoint.init_from`は禁止され、`resume`だけが許可されます。各iterationで
+source priorを生成し、対角CE用の時刻と整合性用の時刻を別々にsampleして、
+両損失を同時にbackwardします。
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+uv run python src/train_joint.py \
+  --config configs/joint_ecld_cityscapes.yaml
+```
+
+## 整合性損失
+
+共通入口は`compute_consistency_loss(...) -> ConsistencyResult`です。teacherは
+stop-gradient、studentは勾配を保持し、損失固有の統計名は衝突しません。
+
+### PSD
+
+`s < u < t`の3時刻をsampleします。`s→u→t`のcomposed Flow Map teacherと
+`s→t`のdirect Flow Map studentを比較し、teacher probabilityを再正規化して
+detachします。PSDはJVPを使いません。そのため設定は必ず次の形です。
+
+```yaml
+precision:
+  jvp_dtype: null
+  numerical_dtype: fp32
+```
+
+PSDへ`bf16`/`fp32` JVPを指定するとconfig validation errorになります。
+
+### CSD
+
+`s < t`をsampleし、Flow Mapの時刻方向JVPと時刻`t`のinstantaneous diagonal
+teacherからFP32 residualを作り、二乗ノルムを最小化します。teacher全体は
+detachされます。`loss_csd`、residual norm、JVP平均/最大絶対値、dtype codeを
+記録します。
+
+### ECLD
+
+時刻方向logits JVPから、完全Jacobianを作らずexact softmax JVP
+
+\[
+\dot p=p\odot\left(\dot z-\langle p,\dot z\rangle\mathbf 1\right)
+\]
+
+を計算します。transport後のendpoint teacherに対するCEと、`gamma(s,t)^2`で
+重み付けしたtemporal derivative lossを`ec_weight`、`td_weight`で合成します。
+`time_weighting`は`none`または`inverse_square`です。
+
+### ESD
+
+既存DFM式を保持しています。対角drift
+
+\[
+b_s=\frac{\psi_{s,s}(x_s)-x_s}{1-s}
+\]
+
+に沿うjoint JVP over `(x_s, s)`を計算し、softmax gaugeを中心化します。
+
+\[
+\delta=D_s z_{s,t}-\langle\psi_{s,t},D_s z_{s,t}\rangle\mathbf 1,
+\]
+
+```python
+log_arg_raw = (
+    one_minus_t[:, None, None, None]
+    - (one_minus_s * delta_time)[:, None, None, None] * delta
+)
+```
+
+teacherは`z_ss - log(clamped_log_arg)`から作り、損失方向は
+`KL(teacher || student)`です。invalid class/pixel/sample率、nonfinite率、
+clamp率、valid率、時刻bucket、teacher entropy、adaptive KL weight、
+skip有無を記録します。`clamp`、`mask_pixel`、`skip_batch`を選べます。
+全画素invalidでもstudent graphを保持するzero lossを返し、対角CEのbackwardを
+継続します。NaN/Infを無条件に0へ置換して問題を隠す実装ではありません。
+
+## bf16 JVPとFP32 JVP
+
+CSD/ECLD/ESDはYAMLで切り替えます。既定はbf16です。
+
+```yaml
+runtime:
+  amp: true
+  amp_dtype: bf16
+loss:
+  consistency:
+    precision:
+      jvp_dtype: bf16  # bf16 | fp32
+      numerical_dtype: fp32
+      debug_assertions: false
+```
+
+`runtime.amp: false`とbf16 JVPの組合せ、`numerical_dtype: bf16`、CUDAでbf16
+非対応の環境は明示的なエラーです。比較時は既存キーをoverrideできます。
+
+```bash
+uv run python src/train.py --config configs/debug_ddp_stage2_ecld.yaml \
+  --set loss.consistency.precision.jvp_dtype=fp32
+```
+
+bf16 pathではモデルforward、JVP内forward、JVP出力、teacher用forwardをbf16に
+し、直後にFP32へ戻します。softmax、log-softmax、exact softmax JVP、Flow Map
+係数、CSD residual、ECLD CE/TD、ESD delta/log/teacher/KL/adaptive weight、
+全diagnosticsと最終lossはFP32です。FP32へ戻すのは、確率の正規化、logの境界、
+小さな差分、KLをbf16の狭い仮数で評価しないためです。
+
+`debug_assertions: true`ではJVP前後、student/teacher probability、lossのdtypeを
+assertします。ログの`*_jvp_dtype_code`はFP32=`0`、bf16=`1`です。実GPU debug
+ではCSD/ECLD/ESDの全runで`1`を確認しました。
+
+## DDP設計
+
+`distributed.enabled: auto`は`WORLD_SIZE > 1`でDDPを有効にし、通常の
+`python src/train.py`ではsingle-processへfallbackします。本学習はNCCL、
+CPU unit testはGlooです。
+
+```yaml
+distributed:
+  enabled: auto
+  backend: nccl
+  init_method: env://
+  find_unused_parameters: false
+  broadcast_buffers: false
+  gradient_as_bucket_view: true
+```
+
+学習用の`DDPCompatibleTrainingModel`はendpoint modelとsource modelを1つの
+composite moduleとして所有します。Stage 1、Stage 2、jointの完全なforward
+graphとJVPを、このcompositeへの1回のDDP `forward`内で構築します。学習損失を
+作るために`ddp_model.module.forward_logits(...)`を外側から呼びません。
+validation、inference、checkpoint保存時だけunwrapします。このためtrainable
+sourceのgradientもendpointと同じDDP reducerで同期されます。frozen sourceは
+gradientを持ちません。
+
+学習DataLoaderは`DistributedSampler`を使い、各epochで`set_epoch(epoch)`を
+呼びます。gradient accumulation中のoptimizer stepを行わないmicro stepは
+`no_sync()`を使い、epoch末または`max_iterations`末の端数もstepします。
+schedulerはoptimizer stepと同期します。
+
+### Global batch size
+
+`training.batch_size`は常にglobal batch sizeです。
+
+```text
+local_batch_size = global_batch_size // world_size
+effective_global_batch_size = global_batch_size * grad_accum_steps
+```
+
+割り切れない場合は開始前にエラーです。2 GPUでglobal batch 4なら各rankの
+local batchは2です。world size、rank、local rank、global/local/effective
+batch、accumulationを開始ログへ記録します。
+
+### 2 GPU実行
 
 ```bash
 cd /home/igarashi_25/playground_2/CSDFM/DFM
-CUDA_VISIBLE_DEVICES=0 \
-uv run python src/train.py \
-  --config configs/stage2_esd_cityscapes.yaml
+
+CUDA_VISIBLE_DEVICES=0,1 \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+uv run torchrun \
+  --standalone \
+  --nproc_per_node=2 \
+  src/train.py \
+  --config configs/stage2_ecld_cityscapes.yaml
 ```
 
-評価:
+```bash
+CUDA_VISIBLE_DEVICES=0,1 \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+uv run torchrun \
+  --standalone \
+  --nproc_per_node=2 \
+  src/train_joint.py \
+  --config configs/joint_ecld_cityscapes.yaml
+```
+
+対応スクリプトは`scripts/train_stage2_{psd,csd,ecld,esd}_ddp.sh`と
+`scripts/train_joint_{psd,csd,ecld,esd}_ddp.sh`です。
+
+## Checkpoint、ログ、評価
+
+rank 0だけがwandbを初期化・記録し、通常ログ、`metrics.jsonl`、
+`config_resolved.yaml`、checkpoint、可視化、evaluation JSONを書きます。
+iteration統計はrank間でmeanまたは、最大絶対値・最大時間についてmax reduction
+してから記録します。GPU peakはrank別リスト、rank平均、rank最大を保存します。
+
+checkpoint保存の前後にbarrierを置き、state dictには`module.` prefixを付けません。
+保存内容はstage、epoch、global step、model、source model、optimizer、
+scheduler、scaler、resolved config、model signature、metrics、world size、
+global/local batchです。resumeは完全復元し、world size変更は許容します。
+global batch変更時は警告します。旧`module.`付きstate dictもload時に除去します。
+
+`init_from`はStage 1のmodel/source重みだけを読み、optimizer等を初期化します。
+joint checkpointは`stage: joint_training`で、joint同士だけresume可能です。
+Stage 1/2 checkpointをjoint resumeへ渡すとstage mismatch errorになります。
+
+YAMLは`extends: base.yaml`で同じディレクトリの設定を継承でき、派生設定は
+上書き部分だけを保持します。load後の完全な設定は各runの
+`config_resolved.yaml`へ保存されるため、実行条件は常に再現できます。
+
+validation/evaluationはpaddingしない`DistributedEvalSampler`を使うため、全画像を
+ちょうど1回だけ評価します。各rankの20×20 confusion matrixをSUM all-reduce
+してからglobal mIoU、pixel accuracy、mean class accuracy、class-wise IoUを
+計算します。GT class 19だけを除外し、prediction class 19は誤予測として残します。
+
+DDP evaluationも可能です。
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 \
-uv run python src/evaluate.py \
-  --config configs/stage2_esd_cityscapes.yaml \
+CUDA_VISIBLE_DEVICES=0,1 \
+uv run torchrun --standalone --nproc_per_node=2 src/evaluate.py \
+  --config configs/stage2_ecld_cityscapes.yaml \
   --checkpoint /path/to/best.pt
 ```
 
-Debug:
+## Debugと実測結果
+
+全debug設定は48×96、1 epoch、2 iterations、global batch 4、DDP local batch 2、
+bf16 AMP、wandb disabledです。Stage 1を作った後、次ですべて実行できます。
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 uv run python src/train.py \
-  --config configs/debug_diagonal_cityscapes.yaml
-CUDA_VISIBLE_DEVICES=0 uv run python src/train.py \
-  --config configs/debug_esd_cityscapes.yaml
+scripts/debug_all_ddp.sh
 ```
 
-限定的な override は、既存キーに限って繰り返し指定できます。未知キーはエラーです。
+2026-07-26、NVIDIA RTX 6000 Ada 2枚、PyTorchのpeak allocated memory実測です。
+全runでloss/gradientはfinite、optimizer step成功、checksum差0、metricsの
+iteration行は2行、checkpointはrank 0の1組だけでした。時刻はwarm-up/初回JVP
+オーバーヘッドを除くiteration 2です。
 
-```bash
-uv run python src/train.py --config configs/stage1_diagonal_cityscapes.yaml \
-  --set training.batch_size=2 \
-  --set runtime.device=cuda
-```
+| 方式 | loss | total loss | consistency loss | grad norm | iter 2 (s) | max peak/rank (MiB) |
+|---|---:|---:|---:|---:|---:|---:|
+| Stage 2 | PSD | 1.80965 | 2.94146 | 0.57854 | 0.0594 | 89.90 |
+| Stage 2 | CSD bf16 | 1.51629 | 0.00207 | 0.57855 | 0.1275 | 163.98 |
+| Stage 2 | ECLD bf16 | 2.69967 | 11.83520 | 0.57946 | 0.1215 | 163.91 |
+| Stage 2 | ESD bf16 | 1.51719 | 0.01101 | 0.57843 | 0.1139 | 173.70 |
+| joint | PSD | 1.81143 | 2.94687 | 0.61167 | 0.0579 | 90.60 |
+| joint | CSD bf16 | 1.51720 | 0.00443 | 0.61142 | 0.1433 | 164.69 |
+| joint | ECLD bf16 | 2.70712 | 11.90321 | 0.61270 | 0.1394 | 164.62 |
+| joint | ESD bf16 | 1.51707 | 0.00333 | 0.61172 | 0.1097 | 174.40 |
 
-## 設定
+### メモリ比較
 
-すべての基本設定は YAML に置きます。
+Stage 2の同じdebug model、global batch 4で比較しました。single GPUはlocal
+batch 4、DDPは各rank local batch 2です。
 
-- `experiment`: run 名、seed、出力先、2 段階のどちらか
-- `runtime`: device、AMP bf16/fp16、compile、deterministic
-- `dataset`: Cityscapes root、20 学習クラス、void index 19、解像度、worker
-- `augmentation`: horizontal flip、color jitter、ImageNet normalize
-- `model`: RRDB image encoder と時間条件付き UNet
-- `source`: `gaussian`、`dirichlet`、`image_gaussian`、SegFormer/UNet source、
-  `mu`/`logvar`、fixed std、align/variance loss
-- `flow`: 分母保護用 `time_eps`（既定値 `1e-5`）
-- `time_sampling`: `[0,1]` の sorted uniform と `min_gap`
-- `training`: epoch、batch、optimizer、parameter group、scheduler、保存/評価間隔
-- `loss`: 対角 CE と ESD の明示的な重み、warm-up、安全策、adaptive KL
-- `checkpoint`: `init_from` または `resume`
-- `evaluation`: split、Flow Map step 数、保存数
-- `wandb`: project、run 名、entity、mode、tag
+| loss / 条件 | JVP code | loss (iter 2) | grad norm | iter 2 (s) | max peak (MiB) |
+|---|---:|---:|---:|---:|---:|
+| ECLD single GPU FP32 | 0 | 2.69718 | 0.59394 | 0.1166 | 419.50 |
+| ECLD DDP FP32 | 0 | 2.69962 | 0.57946 | 0.1326 | 264.85 |
+| ECLD DDP bf16 | 1 | 2.69967 | 0.57946 | 0.1215 | 163.91 |
+| ESD single GPU FP32 | 0 | 1.51595 | 0.59401 | 0.0820 | 355.93 |
+| ESD DDP FP32 | 0 | 1.51720 | 0.57843 | 0.1115 | 189.61 |
+| ESD DDP bf16 | 1 | 1.51719 | 0.57843 | 0.1139 | 173.70 |
 
-実際に使用した、CLI override 適用後の全設定は必ず
-`config_resolved.yaml` に保存されます。
-
-## DFM と Stage 1
-
-経路は
-
-\[
-x_t=(1-t)x_0+t x_1
-\]
-
-です。`x_1` は void を含む 20-class one-hot、`x_0` は `source.prior_type`
-で選んだ prior です。Stage 1 はモデルへ `(x_t, I, s=t, t=t)` を渡し、
-
-\[
-L_{\rm diag}=\operatorname{CE}(z_{t,t},y)
-\]
-
-だけを学習します。label smoothing は `training.label_smoothing` です。
-
-mean-denoiser Flow Map は
-
-\[
-X^\theta_{s,t}(x_s)
-=x_s+\frac{t-s}{1-s}\left(\psi^\theta_{s,t}(x_s)-x_s\right)
-\]
-
-であり、コードではゼロ除算を防ぐ分母だけ
-`(1-s).clamp_min(flow.time_eps)` としています。1-step 推論は `s=0,t=1`、
-複数 step は `[0,1]` の等間隔 grid です。
-
-## Stage 2 と ESD
-
-Stage 2 の損失は曖昧な `eta` ではなく、
-
-```text
-loss_total =
-    primary.weight * loss_diagonal
-  + consistency.weight * consistency.max_weight * schedule * loss_esd
-  + source.var_weight * loss_source_var
-  + source.align_weight * loss_source_align
-```
-
-です。`max_weight` は通常 `1.0` とし、`schedule` は `start_epoch` と
-`warmup_epochs` による linear warm-up です。
-
-対角 drift は
-
-\[
-b_s=\frac{\psi_{s,s}(x_s)-x_s}{1-s}.
-\]
-
-`torch.func.jvp` で入力 `(x_s,s)`、tangent `(b_s,1)` の joint derivative
-
-\[
-D_s z_{s,t}=\partial_s z_{s,t}+J_xz_{s,t}\,b_s
-\]
-
-を直接計算します。完全 Jacobian は作りません。softmax gauge を除くため、
-
-\[
-\delta=D_s z_{s,t}
--\langle\psi_{s,t},D_s z_{s,t}\rangle\mathbf 1
-\]
-
-とし、
-
-\[
-a=(1-t)\mathbf1-(1-s)(t-s)\delta,\qquad
-z^{teacher}=z_{s,s}-\log a
-\]
-
-から `teacher_prob = softmax(z_teacher).detach()` を作ります。損失は
-`KL(teacher || student)` です。JVP、delta、`a`、log、teacher softmax、KL、
-統計は AMP の外で float32 に昇格します。student logits は detach しません。
-
-## invalid teacher と adaptive KL
-
-`a` に非 finite または `<= log_eps` のクラスがある割合が
-`esd_clamp_ratio` です。画素内の全クラスが finite かつ正の場合だけ
-`esd_valid_pixel_ratio` に数えます。iteration 値と epoch 平均に加え、
-`t` bucket 別 clamp 率も `metrics.jsonl` に保存します。
-
-- `clamp`: log 入力を安全化し、全画素の KL を使う比較用モード
-- `mask_pixel`（既定）: 1 クラスでも invalid な画素を KL 平均から除外
-- `skip_batch`: 指定 threshold を超える batch の ESD だけをゼロ化
-- `skip_batch_threshold`: `mask_pixel` と併用した場合も、超過 batch の ESD
-  だけをゼロ化
-
-有効画素が 0 の場合は student graph を保持するゼロ loss を返すため、
-対角 CE の backward は継続します。
-
-adaptive KL は
-
-\[
-w(x)=\operatorname{sg}\left[
-(\lVert q-p\rVert_2^2+c)^{-r}
-\right]
-\]
-
-です。`normalize_mean` と `max_weight` を設定でき、weight は detach
-されています。
-
-## `init_from` と `resume`
-
-両方を同時に指定すると設定エラーです。
-
-- `init_from`: `diagonal_pretrain` stage、20 classes、モデル全設定、source の
-  主要構成を照合し、model/source 重みだけを strict load します。optimizer、
-  scheduler、scaler、epoch、global step は引き継ぎません。
-- `resume`: 同じ stage の途中 checkpoint から model、source、optimizer、
-  scheduler、scaler、completed epoch、global step、best mIoU を完全復元します。
-  `resume` の完全復元は `load_optimizer`/`load_scheduler` で無効化できません。
-
-checkpoint には次を保存します。
-
-```text
-stage, epoch, global_step, model, source_model,
-optimizer, scheduler, scaler, config, model_signature, metrics
-```
-
-出力は `latest.pt`、`best.pt`、`epoch_XXXX.pt`、`config_resolved.yaml`、
-`train_log.txt`、`metrics.jsonl` です。`best.pt` は validation mIoU 最大です。
-
-## Cityscapes 評価
-
-モデルは 20 クラスすべてで学習します。評価の confusion matrix は 20×20
-のまま、GT class 19 の画素だけを除外します。prediction class 19 は除外せず、
-通常の誤予測として数えます。mIoU、pixel accuracy、mean class accuracy、
-class 0–18 の IoU/accuracy、confusion matrix を出力します。
+local batch分割により、DDP FP32のrank最大はsingle FP32比でECLD 36.9%、
+ESD 46.7%減りました。さらにbf16 JVPはDDP FP32比でECLD 38.1%、ESD 8.4%
+減りました。DDP自体が「1 GPU内の1サンプル当たりメモリ」を減らすわけではなく、
+同じglobal batchを複数GPUのlocal batchへ分割した結果、各GPUのbatch由来メモリ
+が減ります。時間は2 iterationだけのdebug測定であり、性能benchmarkでは
+ありません。
 
 ## テスト
 
@@ -225,17 +334,18 @@ class 0–18 の IoU/accuracy、confusion matrix を出力します。
 uv run pytest -q
 ```
 
-config strictness、Flow Map endpoint、float32/bf16、Stage 1 の ESD/JVP 非呼出、
-checkpoint transition/resume、joint JVP、KL 方向、teacher detach、invalid
-mask、全画素 invalid、adaptive weight、bf16 autocast、void 評価を検証します。
+config strictness、4損失と時刻順序、PSD JVP禁止、bf16/FP32の実dtypeとFP32
+post-processing、softmax JVP、teacher detach、ESD invalid/adaptive処理、
+Stage回帰、joint、checkpoint、void評価、CPU/Gloo 2-process reduction、
+no_sync、endpoint/source gradient同期、frozen source、rank 0保存、
+non-padding samplerを検証します。
 
 ## 既知の制限
 
-- endpoint model は現在 UNet のみです。source model は SegFormer と軽量 UNet
-  を選択できます。
-- ESD の joint JVP は通常の対角 forward より GPU memory を多く使います。
-- `source.pretrained: true` の初回実行は Hugging Face weight の取得または
-  ローカル cache が必要です。
-- debug run は配線・finite backward の確認用で、2 iteration の精度には
-  学習性能上の意味はありません。
-
+- endpoint modelは現在UNetのみです。sourceはSegFormerと軽量UNetです。
+- 主対象は単一ノードNCCLです。multi-nodeの性能・障害復旧は未検証です。
+- ESD joint JVPとCSD/ECLD JVPは通常の対角forwardよりメモリを使います。
+- `source.pretrained: true`の初回はHugging Face weightまたはcacheが必要です。
+- bf16の可否はCUDA deviceで実行開始時に検証します。FP16 JVPは未対応です。
+- debug runは配線、dtype、finite backward、DDP同期確認用で、精度評価では
+  ありません。

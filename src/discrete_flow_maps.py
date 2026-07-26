@@ -64,6 +64,61 @@ def sample_sorted_times(
     return s, t
 
 
+def sample_ordered_times(
+    batch_size: int,
+    count: int,
+    device: torch.device,
+    min_time: float = 0.0,
+    max_time: float = 1.0,
+    min_gap: float = 1.0e-5,
+) -> tuple[torch.Tensor, ...]:
+    """Sorted uniform times with rejection for every adjacent minimum gap."""
+    if count < 2:
+        raise ValueError("count must be at least 2")
+    if (count - 1) * min_gap > max_time - min_time:
+        raise ValueError("Configured time interval cannot fit all minimum gaps")
+    times = min_time + (max_time - min_time) * torch.rand(
+        batch_size, count, device=device
+    )
+    times = torch.sort(times, dim=1).values
+    invalid = (times[:, 1:] - times[:, :-1] < min_gap).any(dim=1)
+    attempts = 0
+    while invalid.any() and attempts < 100:
+        replacement = min_time + (max_time - min_time) * torch.rand(
+            int(invalid.sum()), count, device=device
+        )
+        times[invalid] = torch.sort(replacement, dim=1).values
+        invalid = (times[:, 1:] - times[:, :-1] < min_gap).any(dim=1)
+        attempts += 1
+    if invalid.any():
+        fallback = torch.linspace(
+            min_time, max_time, count, device=device, dtype=times.dtype
+        )
+        times[invalid] = fallback
+    return tuple(times.unbind(dim=1))
+
+
+def sample_consistency_times(
+    loss_type: str,
+    batch_size: int,
+    device: torch.device,
+    min_time: float = 0.0,
+    max_time: float = 1.0,
+    min_gap: float = 1.0e-5,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    if loss_type == "psd":
+        s, u, t = sample_ordered_times(
+            batch_size, 3, device, min_time, max_time, min_gap
+        )
+        return s, u, t
+    if loss_type in {"csd", "ecld", "esd"}:
+        s, t = sample_ordered_times(
+            batch_size, 2, device, min_time, max_time, min_gap
+        )
+        return s, None, t
+    raise ValueError(f"Unknown consistency loss: {loss_type}")
+
+
 def sample_prior(
     config: dict,
     image: torch.Tensor,
@@ -139,4 +194,3 @@ def make_time_grid(num_steps: int, device: torch.device) -> list[tuple[torch.Ten
         raise ValueError("evaluation.num_steps must be positive")
     grid = torch.linspace(0.0, 1.0, num_steps + 1, device=device)
     return [(grid[index], grid[index + 1]) for index in range(num_steps)]
-

@@ -9,6 +9,13 @@ runtime:
   amp_dtype: bf16
   compile: false
   deterministic: false
+distributed:
+  enabled: auto
+  backend: nccl
+  init_method: env://
+  find_unused_parameters: false
+  broadcast_buffers: false
+  gradient_as_bucket_view: true
 dataset:
   name: cityscapes
   root: /home/igarashi_25/datasets/cityscapes
@@ -102,6 +109,10 @@ loss:
     warmup_epochs: 0
     schedule: linear
     max_weight: 1.0
+    precision: {jvp_dtype: bf16, numerical_dtype: fp32, debug_assertions: false}
+    psd: {}
+    csd: {}
+    ecld: {ec_weight: 4.0, td_weight: 2.0, time_weighting: none}
     adaptive_kl:
       enabled: false
       c: 1.0e-6
@@ -134,4 +145,3 @@ wandb:
   entity: null
   mode: online
   tags: [cityscapes, stage1, diagonal]
-
