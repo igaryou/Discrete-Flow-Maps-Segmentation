@@ -41,26 +41,26 @@ model:
   backbone: unet
   num_classes: 20
   fusion_channels: 128
-  rrdb_blocks: 5
+  rrdb_blocks: 3
   rrdb_growth_channels: 32
   unet:
-    base_channels: 64
-    channel_mults: [1, 2, 4, 4]
+    base_channels: 45
+    channel_mults: [1, 2, 4, 4, 8]
     num_res_blocks: 2
-    attention_levels: [3]
+    attention_levels: [3, 4]
     num_heads: 4
     dropout: 0.0
-    time_embedding_dim: 256
+    time_embedding_dim: 512
 source:
   prior_type: image_gaussian
   prior_noise_std: 1.0
   backbone: segformer
-  segformer_variant: b0
+  segformer_variant: b1
   pretrained: true
   checkpoint: null
   freeze: false
   freeze_encoder: false
-  decoder_channels: 128
+  decoder_channels: 256
   learned_logvar: false
   fixed_std: 1.0
   mu_tanh_scale: 0.0
@@ -78,27 +78,27 @@ time_sampling:
   max_time: 1.0
   min_gap: 1.0e-5
 training:
-  epochs: 150
+  epochs: 800
   max_iterations: null
   batch_size: 4
   grad_accum_steps: 1
   optimizer:
     name: adamw
-    lr: 5.0e-5
-    weight_decay: 1.0e-4
+    lr: 1.0e-4
+    weight_decay: 1.0e-3
     betas: [0.9, 0.999]
     parameter_groups:
-      model: {lr: 5.0e-5}
-      source: {lr: 5.0e-6}
+      model: {lr: 1.0e-4}
+      source: {lr: 5.0e-5}
   scheduler:
     name: cosine
     warmup_epochs: 10
-    eta_min: 1.0e-6
+    eta_min: 5.0e-7
   grad_clip: 1.0
-  label_smoothing: 0.1
+  label_smoothing: 0.0
   log_interval: 50
   checkpoint_interval_epochs: 10
-  validation_epochs: [50, 100, 150]
+  validation_epochs: [75, 150, 200, 300, 500, 600, 800]
 loss:
   primary: {type: diagonal_ce, weight: 0.5}
   consistency:
@@ -106,7 +106,7 @@ loss:
     type: esd
     weight: 0.5
     start_epoch: 0
-    warmup_epochs: 20
+    warmup_epochs: 0
     schedule: linear
     max_weight: 1.0
     precision: {jvp_dtype: bf16, numerical_dtype: fp32, debug_assertions: false}
@@ -136,7 +136,7 @@ checkpoint:
 evaluation:
   split: val
   batch_size: 4
-  num_steps: 15
+  num_steps: 1
   sampler: flow_map
   save_predictions: true
   max_visualizations: 16

@@ -5,7 +5,6 @@ experiment:
 loss:
   consistency:
     type: ecld
-    weight: 0.1
     ecld:
       ec_weight: 4.0
       td_weight: 2.0

@@ -10,6 +10,7 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+from tqdm.auto import tqdm
 
 from checkpoint import (
     checkpoint_payload,
@@ -72,6 +73,167 @@ MIN_REDUCTION_KEYS = {
     "s_min",
     "t_min",
 }
+
+EPOCH_SUMMARY_OPTIONAL_KEYS = (
+    "loss_psd",
+    "psd_teacher_entropy",
+    "loss_csd",
+    "csd_residual_norm",
+    "loss_ecld",
+    "loss_ecld_ec",
+    "loss_ecld_td",
+    "ecld_dt_prob_norm",
+    "loss_esd",
+    "esd_teacher_entropy",
+    "esd_clamp_ratio",
+    "esd_pixel_invalid_ratio",
+    "esd_sample_invalid_ratio",
+    "esd_nonfinite_ratio",
+    "esd_skipped_batch",
+    "loss_source_var",
+    "loss_source_align",
+    "weighted_var",
+    "weighted_align",
+    "source_mu_abs",
+    "source_logvar_mean",
+)
+
+
+class _DisplayRunningMeans:
+    """Small rank-local accumulator used only for terminal presentation."""
+
+    KEYS = (
+        "loss_total",
+        "loss_diagonal",
+        "loss_consistency",
+        "runtime_iteration_time",
+    )
+
+    def __init__(self) -> None:
+        self.sums = {key: 0.0 for key in self.KEYS}
+        self.counts = {key: 0 for key in self.KEYS}
+
+    def update(self, metrics: dict) -> None:
+        for key in self.KEYS:
+            value = metrics.get(key)
+            if torch.is_tensor(value):
+                if value.numel() != 1:
+                    continue
+                scalar = float(value.detach().float().cpu())
+            elif isinstance(value, (int, float)):
+                scalar = float(value)
+            else:
+                continue
+            if math.isfinite(scalar):
+                self.sums[key] += scalar
+                self.counts[key] += 1
+
+    def means(self) -> dict[str, float]:
+        return {
+            key: self.sums[key] / count
+            for key, count in self.counts.items()
+            if count
+        }
+
+
+def _epoch_total_iterations(
+    loader_length: int,
+    max_iterations: int | None,
+    total_iterations: int,
+) -> int:
+    if max_iterations is None:
+        return loader_length
+    remaining_iterations = max(max_iterations - total_iterations, 0)
+    return min(loader_length, remaining_iterations)
+
+
+def _create_epoch_progress(
+    *,
+    epoch_index: int,
+    total: int,
+    is_main_process: bool,
+):
+    if not is_main_process:
+        return None
+    return tqdm(
+        total=total,
+        desc=f"epoch {epoch_index + 1}",
+        dynamic_ncols=True,
+        leave=True,
+        unit="batch",
+        mininterval=0.5,
+    )
+
+
+def _gpu_memory_gb(device: torch.device) -> float | None:
+    if device.type != "cuda":
+        return None
+    return torch.cuda.memory_reserved(device) / 1024**3
+
+
+def _progress_postfix(
+    running_means: dict[str, float],
+    *,
+    consistency_type: str,
+    lr: float,
+    sec_per_batch: float,
+    memory_gb: float | None,
+) -> dict[str, str]:
+    postfix = {
+        "loss": f"{running_means['loss_total']:.4f}",
+        "diag": f"{running_means['loss_diagonal']:.4f}",
+        consistency_type: f"{running_means['loss_consistency']:.4f}",
+        "lr": f"{lr:.3e}",
+        "sec/batch": f"{sec_per_batch:.2f}",
+    }
+    if memory_gb is not None:
+        postfix["mem"] = f"{memory_gb:.1f}G"
+    return postfix
+
+
+def _format_epoch_summary(
+    *,
+    epoch: int,
+    reduced_epoch: dict[str, torch.Tensor | float],
+    consistency_type: str,
+    sec_per_batch: float | None = None,
+) -> str:
+    required = (
+        "loss_total",
+        "loss_diagonal",
+        "loss_consistency",
+        "consistency_effective_weight",
+        "lr",
+    )
+    missing = [key for key in required if key not in reduced_epoch]
+    if missing:
+        raise KeyError(f"Missing required epoch summary metrics: {missing}")
+
+    loss_total = float(reduced_epoch["loss_total"])
+    fields = [
+        f"epoch:{epoch}",
+        f"loss_avg:{loss_total:.6f}",
+        f"loss_total:{loss_total:.6f}",
+        f"loss_primary:{float(reduced_epoch['loss_diagonal']):.6f}",
+        f"loss_consistency:{float(reduced_epoch['loss_consistency']):.6f}",
+        f"consistency_type:{consistency_type}",
+        (
+            "consistency_weight:"
+            f"{float(reduced_epoch['consistency_effective_weight']):.6f}"
+        ),
+    ]
+    fields.extend(
+        f"{key}:{float(reduced_epoch[key]):.6f}"
+        for key in EPOCH_SUMMARY_OPTIONAL_KEYS
+        if key in reduced_epoch
+    )
+    fields.append(f"lr:{float(reduced_epoch['lr']):.6e}")
+    if sec_per_batch is None and "runtime_iteration_time" in reduced_epoch:
+        sec_per_batch = float(reduced_epoch["runtime_iteration_time"])
+    if sec_per_batch is None:
+        raise KeyError("Missing required epoch summary metric: sec_per_batch")
+    fields.append(f"sec_per_batch:{sec_per_batch:.6f}")
+    return " ".join(fields)
 
 
 def _wandb_iteration_payload(
@@ -456,116 +618,146 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                 min_keys=MIN_REDUCTION_KEYS,
                 max_keys=MAX_REDUCTION_KEYS,
             )
-            for batch_index, (image, one_hot, target) in enumerate(train_loader):
-                if max_iterations is not None and total_iterations >= max_iterations:
-                    break
-                iteration_start = time.perf_counter()
-                image = image.to(context.device, non_blocking=True)
-                one_hot = one_hot.to(context.device, non_blocking=True)
-                target = target.to(context.device, non_blocking=True)
-                reaches_limit = (
-                    max_iterations is not None
-                    and total_iterations + 1 >= max_iterations
-                )
-                should_step = (
-                    (batch_index + 1) % training["grad_accum_steps"] == 0
-                    or batch_index + 1 == len(train_loader)
-                    or reaches_limit
-                )
-                sync_context = (
-                    training_model.no_sync()
-                    if context.distributed and not should_step
-                    else nullcontext()
-                )
-                with sync_context:
-                    with autocast_context(config, context.device):
-                        objectives = run_model_training_objectives(
-                            training_model,
-                            operation=operation,
-                            image=image,
-                            one_hot=one_hot,
-                            target=target,
-                            epoch_index=epoch_index,
-                            progress_in_epoch=batch_index / max(len(train_loader), 1),
-                        )
-                        scaled_loss = (
-                            objectives["loss"] / training["grad_accum_steps"]
-                        )
-                    scaler.scale(scaled_loss).backward()
-
-                grad_norm = torch.zeros((), device=context.device)
-                if should_step:
-                    scaler.unscale_(optimizer)
-                    if training["grad_clip"] is not None:
-                        grad_norm = torch.nn.utils.clip_grad_norm_(
-                            adapter.parameters(), training["grad_clip"]
-                        )
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad(set_to_none=True)
-                    scheduler.step()
-                    state.global_step += 1
-                if context.device.type == "cuda":
-                    torch.cuda.synchronize(context.device)
-                local_iteration_time = time.perf_counter() - iteration_start
-                global_iteration_time = reduce_scalar(
-                    local_iteration_time, context, "max"
-                )
-                samples_per_second = (
-                    global_batch_size / global_iteration_time.clamp_min(1.0e-9)
-                )
-                total_iterations += 1
-                batch_stats = dict(objectives["stats"])
-                batch_stats.update({
-                    "lr": optimizer.param_groups[0]["lr"],
-                    "grad_norm": grad_norm.detach(),
-                    "epoch": epoch_index + 1,
-                    "global_step": state.global_step,
-                    "runtime_iteration_time": global_iteration_time,
-                    "runtime_samples_per_second": samples_per_second,
-                })
-                epoch_meter.update(batch_stats)
-
-                should_log = (
-                    total_iterations % training["log_interval"] == 0
-                    or total_iterations == 1
-                )
-                if should_log:
-                    scalar_stats = {
-                        key: value for key, value in batch_stats.items()
-                        if (
-                            torch.is_tensor(value) and value.numel() == 1
-                        ) or isinstance(value, (int, float))
-                    }
-                    reduced = reduce_metric_dict(
-                        scalar_stats,
-                        context,
-                        min_keys=MIN_REDUCTION_KEYS,
-                        max_keys=MAX_REDUCTION_KEYS,
+            display_meter = _DisplayRunningMeans()
+            progress = _create_epoch_progress(
+                epoch_index=epoch_index,
+                total=_epoch_total_iterations(
+                    len(train_loader), max_iterations, total_iterations
+                ),
+                is_main_process=context.is_main_process,
+            )
+            try:
+                for batch_index, (image, one_hot, target) in enumerate(train_loader):
+                    if max_iterations is not None and total_iterations >= max_iterations:
+                        break
+                    iteration_start = time.perf_counter()
+                    image = image.to(context.device, non_blocking=True)
+                    one_hot = one_hot.to(context.device, non_blocking=True)
+                    target = target.to(context.device, non_blocking=True)
+                    reaches_limit = (
+                        max_iterations is not None
+                        and total_iterations + 1 >= max_iterations
                     )
-                    if context.is_main_process:
-                        record = {
-                            "scope": "iteration",
-                            "stage": stage,
-                            "consistency_type": objectives["consistency_type"],
-                            "iteration": total_iterations,
-                            **reduced,
-                        }
-                        append_jsonl(metrics_path, record)
-                        logger.info(
-                            "epoch=%d iter=%d step=%d loss=%.6g diag=%.6g "
-                            "consistency=%.6g type=%s",
-                            epoch_index + 1, total_iterations, state.global_step,
-                            float(reduced["loss_total"]),
-                            float(reduced["loss_diagonal"]),
-                            float(reduced["loss_consistency"]),
-                            objectives["consistency_type"],
-                        )
-                        if wandb_run is not None:
-                            wandb_run.log(
-                                _wandb_iteration_payload(reduced),
-                                step=state.global_step,
+                    should_step = (
+                        (batch_index + 1) % training["grad_accum_steps"] == 0
+                        or batch_index + 1 == len(train_loader)
+                        or reaches_limit
+                    )
+                    sync_context = (
+                        training_model.no_sync()
+                        if context.distributed and not should_step
+                        else nullcontext()
+                    )
+                    with sync_context:
+                        with autocast_context(config, context.device):
+                            objectives = run_model_training_objectives(
+                                training_model,
+                                operation=operation,
+                                image=image,
+                                one_hot=one_hot,
+                                target=target,
+                                epoch_index=epoch_index,
+                                progress_in_epoch=(
+                                    batch_index / max(len(train_loader), 1)
+                                ),
                             )
+                            scaled_loss = (
+                                objectives["loss"] / training["grad_accum_steps"]
+                            )
+                        scaler.scale(scaled_loss).backward()
+
+                    grad_norm = torch.zeros((), device=context.device)
+                    if should_step:
+                        scaler.unscale_(optimizer)
+                        if training["grad_clip"] is not None:
+                            grad_norm = torch.nn.utils.clip_grad_norm_(
+                                adapter.parameters(), training["grad_clip"]
+                            )
+                        scaler.step(optimizer)
+                        scaler.update()
+                        optimizer.zero_grad(set_to_none=True)
+                        scheduler.step()
+                        state.global_step += 1
+                    if context.device.type == "cuda":
+                        torch.cuda.synchronize(context.device)
+                    local_iteration_time = time.perf_counter() - iteration_start
+                    global_iteration_time = reduce_scalar(
+                        local_iteration_time, context, "max"
+                    )
+                    samples_per_second = (
+                        global_batch_size / global_iteration_time.clamp_min(1.0e-9)
+                    )
+                    total_iterations += 1
+                    batch_stats = dict(objectives["stats"])
+                    batch_stats.update({
+                        "lr": optimizer.param_groups[0]["lr"],
+                        "grad_norm": grad_norm.detach(),
+                        "epoch": epoch_index + 1,
+                        "global_step": state.global_step,
+                        "runtime_iteration_time": global_iteration_time,
+                        "runtime_samples_per_second": samples_per_second,
+                    })
+                    epoch_meter.update(batch_stats)
+
+                    if context.is_main_process:
+                        display_meter.update(batch_stats)
+                        progress.set_postfix(
+                            _progress_postfix(
+                                display_meter.means(),
+                                consistency_type=objectives["consistency_type"],
+                                lr=float(batch_stats["lr"]),
+                                sec_per_batch=float(global_iteration_time),
+                                memory_gb=_gpu_memory_gb(context.device),
+                            ),
+                            refresh=False,
+                        )
+                        progress.update(1)
+
+                    should_log = (
+                        total_iterations % training["log_interval"] == 0
+                        or total_iterations == 1
+                    )
+                    if should_log:
+                        scalar_stats = {
+                            key: value for key, value in batch_stats.items()
+                            if (
+                                torch.is_tensor(value) and value.numel() == 1
+                            ) or isinstance(value, (int, float))
+                        }
+                        reduced = reduce_metric_dict(
+                            scalar_stats,
+                            context,
+                            min_keys=MIN_REDUCTION_KEYS,
+                            max_keys=MAX_REDUCTION_KEYS,
+                        )
+                        if context.is_main_process:
+                            record = {
+                                "scope": "iteration",
+                                "stage": stage,
+                                "consistency_type": objectives["consistency_type"],
+                                "iteration": total_iterations,
+                                **reduced,
+                            }
+                            append_jsonl(metrics_path, record)
+                            logger.info(
+                                "epoch=%d iter=%d step=%d loss=%.6g diag=%.6g "
+                                "consistency=%.6g type=%s",
+                                epoch_index + 1, total_iterations,
+                                state.global_step,
+                                float(reduced["loss_total"]),
+                                float(reduced["loss_diagonal"]),
+                                float(reduced["loss_consistency"]),
+                                objectives["consistency_type"],
+                                extra={"console": False},
+                            )
+                            if wandb_run is not None:
+                                wandb_run.log(
+                                    _wandb_iteration_payload(reduced),
+                                    step=state.global_step,
+                                )
+            finally:
+                if progress is not None:
+                    progress.close()
 
             epoch_values = epoch_meter.compute()
             epoch_tensors = {
@@ -584,12 +776,16 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                     "consistency_type": config["loss"]["consistency"]["type"],
                     "epoch": epoch_index + 1, **reduced_epoch,
                 })
-                logger.info(
-                    "epoch=%d average_loss=%.6g average_consistency=%.6g",
-                    epoch_index + 1,
-                    float(reduced_epoch.get("loss_total", torch.tensor(float("nan")))),
-                    float(reduced_epoch.get("loss_consistency", torch.tensor(0.0))),
+                summary = _format_epoch_summary(
+                    epoch=epoch_index + 1,
+                    reduced_epoch=reduced_epoch,
+                    consistency_type=config["loss"]["consistency"]["type"],
+                    sec_per_batch=display_meter.means().get(
+                        "runtime_iteration_time"
+                    ),
                 )
+                tqdm.write(summary)
+                logger.info(summary, extra={"console": False})
                 if wandb_run is not None:
                     wandb_run.log({
                         f"epoch/train/{key}": float(value)

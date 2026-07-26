@@ -12,6 +12,11 @@ import numpy as np
 import torch
 
 
+class _ConsoleVisibilityFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return bool(getattr(record, "console", True))
+
+
 def resolve_device(name: str) -> torch.device:
     if name == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -58,6 +63,7 @@ def setup_logger(output_dir: str | Path) -> logging.Logger:
         formatter = logging.Formatter("%(asctime)s | %(message)s", "%Y-%m-%d %H:%M:%S")
         stream = logging.StreamHandler()
         stream.setFormatter(formatter)
+        stream.addFilter(_ConsoleVisibilityFilter())
         file_handler = logging.FileHandler(output / "train_log.txt", encoding="utf-8")
         file_handler.setFormatter(formatter)
         logger.addHandler(stream)
@@ -108,4 +114,3 @@ def init_wandb(config: dict[str, Any]):
         tags=config["wandb"]["tags"],
         config=config,
     )
-
