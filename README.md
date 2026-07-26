@@ -118,6 +118,12 @@ detachされます。`loss_csd`、residual norm、JVP平均/最大絶対値、dt
 
 ### ESD
 
+本実装のESDは、Discrete Flow Maps論文で導出された
+**stabilized logit-space ESD**を基礎とします。logit-space teacher、
+joint JVP、softmax gauge centering、終端付近で悪条件となる係数を直接計算しない
+安定形、およびteacherからstudentへのforward KLはDFM論文由来です。
+stabilized ESD自体を本リポジトリ独自の手法として導入したものではありません。
+
 既存DFM式を保持しています。対角drift
 
 \[
@@ -143,6 +149,38 @@ clamp率、valid率、時刻bucket、teacher entropy、adaptive KL weight、
 skip有無を記録します。`clamp`、`mask_pixel`、`skip_batch`を選べます。
 全画素invalidでもstudent graphを保持するzero lossを返し、対角CEのbackwardを
 継続します。NaN/Infを無条件に0へ置換して問題を隠す実装ではありません。
+
+本リポジトリは論文由来のstabilized logit-space ESDに加え、
+implementation-level numerical safeguardsとして、invalid log argument検出、
+`log_eps` clamp、`mask_pixel`、`skip_batch`、clamp/invalid率の診断、
+optional adaptive KL weighting、そのmean normalizationと最大値clamp、
+consistency weight warm-up、bf16/FP32 JVP切り替え、JVP後のFP32数値計算を
+提供します。論文由来の安定化と、これら追加安全策は区別してください。
+
+ESDの由来と実装形は実験条件metadataにも保存されます。
+
+```yaml
+loss:
+  consistency:
+    esd:
+      formulation: stabilized_logit_space
+      source: discrete_flow_maps
+      additional_numerical_safeguards: true
+```
+
+`additional_numerical_safeguards: true`は、この実装が追加安全策を備えることを
+示すmetadataです。実際に有効な条件は、次の個別設定から判断します。
+
+- `invalid_teacher.strategy`、`log_eps`、`skip_batch_threshold`
+- `adaptive_kl.enabled`、`c`、`r`、`normalize_mean`、`max_weight`
+- `consistency.weight`、`consistency.warmup_epochs`
+- `precision.jvp_dtype`、`precision.numerical_dtype`
+
+実験結果では`DFM-ESD`と表記し、必要に応じて
+`DFM-ESD (mask_pixel, adaptive KL, bf16 JVP)`または
+`DFM-ESD + numerical safeguards`のように詳細条件を併記してください。
+`ESD (stabilized)`だけでは、DFM論文由来の安定化と本実装の追加安全策の区別が
+曖昧になるため推奨しません。
 
 ## bf16 JVPとFP32 JVP
 

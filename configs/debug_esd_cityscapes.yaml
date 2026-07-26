@@ -107,6 +107,10 @@ loss:
     psd: {}
     csd: {}
     ecld: {ec_weight: 4.0, td_weight: 2.0, time_weighting: none}
+    esd:
+      formulation: stabilized_logit_space
+      source: discrete_flow_maps
+      additional_numerical_safeguards: true
     adaptive_kl:
       enabled: true
       c: 1.0e-6

@@ -4,9 +4,16 @@ import pytest
 import yaml
 
 from config import load_config, save_resolved_config
+from trainer import log_esd_experiment_metadata
 
 
 CONFIG = Path(__file__).parents[1] / "configs" / "debug_diagonal_cityscapes.yaml"
+ESD_CONFIG = Path(__file__).parents[1] / "configs" / "debug_esd_cityscapes.yaml"
+EXPECTED_ESD_METADATA = {
+    "formulation": "stabilized_logit_space",
+    "source": "discrete_flow_maps",
+    "additional_numerical_safeguards": True,
+}
 
 
 def test_yaml_load_and_cli_override():
@@ -87,3 +94,52 @@ def test_legacy_single_gpu_yaml_can_omit_distributed(tmp_path):
     config = load_config(path)
     assert config["distributed"]["enabled"] == "auto"
     assert config["distributed"]["backend"] == "nccl"
+
+
+def test_legacy_esd_yaml_without_metadata_uses_defaults_and_resolves(tmp_path):
+    raw = yaml.safe_load(ESD_CONFIG.read_text())
+    raw["loss"]["consistency"].pop("esd")
+    legacy_path = tmp_path / "legacy_esd.yaml"
+    legacy_path.write_text(yaml.safe_dump(raw))
+    config = load_config(legacy_path)
+    assert config["loss"]["consistency"]["esd"] == EXPECTED_ESD_METADATA
+
+    resolved_path = tmp_path / "resolved.yaml"
+    save_resolved_config(config, resolved_path)
+    resolved = yaml.safe_load(resolved_path.read_text())
+    assert resolved["loss"]["consistency"]["esd"] == EXPECTED_ESD_METADATA
+
+
+def test_esd_metadata_rejects_unimplemented_formulation_and_wrong_source():
+    with pytest.raises(ValueError, match="formulation must be"):
+        load_config(
+            ESD_CONFIG,
+            ["loss.consistency.esd.formulation=raw"],
+        )
+    with pytest.raises(ValueError, match="source must be"):
+        load_config(
+            ESD_CONFIG,
+            ["loss.consistency.esd.source=other"],
+        )
+
+
+def test_esd_startup_log_uses_resolved_metadata_and_safeguard_settings():
+    config = load_config(ESD_CONFIG)
+
+    class CapturingLogger:
+        def __init__(self):
+            self.messages = []
+
+        def info(self, message, *args):
+            self.messages.append(message % args if args else message)
+
+    logger = CapturingLogger()
+    log_esd_experiment_metadata(config, logger)
+    assert logger.messages == [
+        "ESD formulation: stabilized_logit_space",
+        "ESD source: discrete_flow_maps",
+        "ESD additional numerical safeguards: true",
+        "ESD invalid teacher strategy: mask_pixel",
+        "ESD JVP dtype: bf16",
+        "ESD numerical dtype: fp32",
+    ]

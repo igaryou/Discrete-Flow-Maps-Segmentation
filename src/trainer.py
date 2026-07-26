@@ -21,6 +21,7 @@ from dataset import build_dataset
 from distributed import (
     DistributedContext,
     DistributedEvalSampler,
+    EpochMetricMeter,
     all_reduce_confusion_matrix,
     assert_config_equal_across_ranks,
     barrier,
@@ -42,7 +43,6 @@ from training_objectives import (
     run_model_training_objectives,
 )
 from utils import (
-    AverageMeter,
     append_jsonl,
     autocast_context,
     build_grad_scaler,
@@ -60,7 +60,17 @@ MAX_REDUCTION_KEYS = {
     "esd_jvp_output_abs_max",
     "csd_jvp_output_abs_max",
     "ecld_jvp_output_abs_max",
+    "esd_teacher_max",
+    "s_max",
+    "t_max",
     "runtime_iteration_time",
+}
+
+MIN_REDUCTION_KEYS = {
+    "esd_log_arg_min",
+    "esd_teacher_min",
+    "s_min",
+    "t_min",
 }
 
 
@@ -85,6 +95,22 @@ class NullLogger:
 
     def warning(self, *args, **kwargs) -> None:
         del args, kwargs
+
+
+def log_esd_experiment_metadata(config: dict, logger) -> None:
+    consistency = config["loss"]["consistency"]
+    esd = consistency["esd"]
+    precision = consistency["precision"]
+    invalid = consistency["invalid_teacher"]
+    logger.info("ESD formulation: %s", esd["formulation"])
+    logger.info("ESD source: %s", esd["source"])
+    logger.info(
+        "ESD additional numerical safeguards: %s",
+        str(esd["additional_numerical_safeguards"]).lower(),
+    )
+    logger.info("ESD invalid teacher strategy: %s", invalid["strategy"])
+    logger.info("ESD JVP dtype: %s", precision["jvp_dtype"])
+    logger.info("ESD numerical dtype: %s", precision["numerical_dtype"])
 
 
 def build_optimizer(config: dict, adapter: DDPCompatibleTrainingModel):
@@ -372,6 +398,16 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
             global_batch_size, local_batch_size,
             config["training"]["grad_accum_steps"], effective_global_batch_size,
         )
+        if (
+            context.is_main_process
+            and stage in {
+                "consistency_distillation",
+                "esd_distillation",
+                "joint_training",
+            }
+            and config["loss"]["consistency"]["type"] == "esd"
+        ):
+            log_esd_experiment_metadata(config, logger)
 
         seed_everything(
             config["experiment"]["seed"], config["runtime"]["deterministic"]
@@ -416,7 +452,10 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                 adapter.source_model.eval()
             if train_sampler is not None:
                 train_sampler.set_epoch(epoch_index)
-            epoch_meter = AverageMeter()
+            epoch_meter = EpochMetricMeter(
+                min_keys=MIN_REDUCTION_KEYS,
+                max_keys=MAX_REDUCTION_KEYS,
+            )
             for batch_index, (image, one_hot, target) in enumerate(train_loader):
                 if max_iterations is not None and total_iterations >= max_iterations:
                     break
@@ -499,7 +538,10 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                         ) or isinstance(value, (int, float))
                     }
                     reduced = reduce_metric_dict(
-                        scalar_stats, context, max_keys=MAX_REDUCTION_KEYS
+                        scalar_stats,
+                        context,
+                        min_keys=MIN_REDUCTION_KEYS,
+                        max_keys=MAX_REDUCTION_KEYS,
                     )
                     if context.is_main_process:
                         record = {
@@ -531,7 +573,10 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                 for key, value in epoch_values.items()
             }
             reduced_epoch = reduce_metric_dict(
-                epoch_tensors, context, max_keys=MAX_REDUCTION_KEYS
+                epoch_tensors,
+                context,
+                min_keys=MIN_REDUCTION_KEYS,
+                max_keys=MAX_REDUCTION_KEYS,
             )
             if context.is_main_process:
                 append_jsonl(metrics_path, {

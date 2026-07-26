@@ -6,7 +6,7 @@ import math
 import os
 import random
 from dataclasses import dataclass
-from typing import Iterator, Mapping, Sized
+from typing import Any, Iterator, Mapping, Sized
 
 import numpy as np
 import torch
@@ -207,13 +207,76 @@ def reduce_metric_dict(
     metrics: Mapping[str, torch.Tensor | float],
     context: DistributedContext,
     *,
+    min_keys: set[str] | None = None,
     max_keys: set[str] | None = None,
 ) -> dict[str, torch.Tensor]:
+    min_keys = min_keys or set()
     max_keys = max_keys or set()
-    return {
-        key: reduce_scalar(value, context, "max" if key in max_keys else "mean")
-        for key, value in metrics.items()
-    }
+    overlap = min_keys & max_keys
+    if overlap:
+        raise ValueError(
+            "Metric keys cannot use both min and max reduction: "
+            f"{sorted(overlap)}"
+        )
+    reduced = {}
+    for key, value in metrics.items():
+        if key in min_keys:
+            reduction = "min"
+        elif key in max_keys:
+            reduction = "max"
+        else:
+            reduction = "mean"
+        reduced[key] = reduce_scalar(value, context, reduction)
+    return reduced
+
+
+class EpochMetricMeter:
+    """Track epoch means and true extrema before cross-rank reduction."""
+
+    def __init__(
+        self,
+        *,
+        min_keys: set[str] | None = None,
+        max_keys: set[str] | None = None,
+    ) -> None:
+        self.min_keys = min_keys or set()
+        self.max_keys = max_keys or set()
+        overlap = self.min_keys & self.max_keys
+        if overlap:
+            raise ValueError(
+                "Metric keys cannot use both min and max reduction: "
+                f"{sorted(overlap)}"
+            )
+        self.sums: dict[str, float] = {}
+        self.counts: dict[str, int] = {}
+        self.minima: dict[str, float] = {}
+        self.maxima: dict[str, float] = {}
+
+    def update(self, metrics: Mapping[str, Any]) -> None:
+        for key, value in metrics.items():
+            if torch.is_tensor(value):
+                if value.numel() != 1:
+                    continue
+                scalar = float(value.detach().float().cpu())
+            elif isinstance(value, (int, float)):
+                scalar = float(value)
+            else:
+                continue
+            if not math.isfinite(scalar):
+                continue
+            if key in self.min_keys:
+                self.minima[key] = min(self.minima.get(key, scalar), scalar)
+            elif key in self.max_keys:
+                self.maxima[key] = max(self.maxima.get(key, scalar), scalar)
+            else:
+                self.sums[key] = self.sums.get(key, 0.0) + scalar
+                self.counts[key] = self.counts.get(key, 0) + 1
+
+    def compute(self) -> dict[str, float]:
+        means = {
+            key: total / self.counts[key] for key, total in self.sums.items()
+        }
+        return means | self.minima | self.maxima
 
 
 def all_reduce_confusion_matrix(

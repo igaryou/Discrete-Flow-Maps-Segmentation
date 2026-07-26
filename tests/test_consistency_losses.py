@@ -1,3 +1,5 @@
+from copy import deepcopy
+
 import pytest
 import torch
 import torch.nn as nn
@@ -177,3 +179,46 @@ def test_psd_rejects_jvp_precision():
             precision={"jvp_dtype": "bf16", "numerical_dtype": "fp32"},
             config=_config("psd", None),
         )
+
+
+@pytest.mark.parametrize("loss_type", ["psd", "csd", "ecld"])
+def test_esd_metadata_does_not_change_other_consistency_losses(loss_type):
+    jvp_dtype = None if loss_type == "psd" else "fp32"
+    config_without_metadata = _config(loss_type, jvp_dtype)
+    config_with_metadata = deepcopy(config_without_metadata)
+    config_with_metadata["loss"]["consistency"]["esd"] = {
+        "formulation": "stabilized_logit_space",
+        "source": "discrete_flow_maps",
+        "additional_numerical_safeguards": True,
+    }
+    x, image, s, u, t = _inputs()
+    model_without_metadata = TinyFlowModel()
+    model_with_metadata = TinyFlowModel()
+    model_with_metadata.load_state_dict(model_without_metadata.state_dict())
+    extra = {"u": u} if loss_type == "psd" else {}
+
+    result_without_metadata = compute_consistency_loss(
+        loss_type,
+        model=model_without_metadata,
+        x_s=x,
+        image=image,
+        s=s,
+        t=t,
+        precision=config_without_metadata["loss"]["consistency"]["precision"],
+        config=config_without_metadata,
+        **extra,
+    )
+    result_with_metadata = compute_consistency_loss(
+        loss_type,
+        model=model_with_metadata,
+        x_s=x,
+        image=image,
+        s=s,
+        t=t,
+        precision=config_with_metadata["loss"]["consistency"]["precision"],
+        config=config_with_metadata,
+        **extra,
+    )
+    torch.testing.assert_close(
+        result_with_metadata.loss, result_without_metadata.loss
+    )

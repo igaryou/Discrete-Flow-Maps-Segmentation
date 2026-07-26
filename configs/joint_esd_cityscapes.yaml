@@ -6,6 +6,12 @@ experiment:
 checkpoint:
   init_from: null
   resume: null
+loss:
+  consistency:
+    esd:
+      formulation: stabilized_logit_space
+      source: discrete_flow_maps
+      additional_numerical_safeguards: true
 wandb:
   name: dfm-joint-esd-256x512
   tags: [cityscapes, joint, esd]

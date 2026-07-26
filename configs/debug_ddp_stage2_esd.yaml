@@ -9,6 +9,10 @@ evaluation:
 loss:
   consistency:
     type: esd
+    esd:
+      formulation: stabilized_logit_space
+      source: discrete_flow_maps
+      additional_numerical_safeguards: true
 wandb:
   name: debug-ddp-stage2-esd
   tags: [debug, ddp, stage2, esd]

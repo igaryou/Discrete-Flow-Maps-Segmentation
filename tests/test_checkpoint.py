@@ -75,6 +75,11 @@ def test_resume_restores_optimizer_scheduler_epoch_and_step(tmp_path):
         optimizer=optimizer, scheduler=scheduler, scaler=scaler,
         metrics={"best_mIoU": 0.5},
     )
+    assert payload["config"]["loss"]["consistency"]["esd"] == {
+        "formulation": "stabilized_logit_space",
+        "source": "discrete_flow_maps",
+        "additional_numerical_safeguards": True,
+    }
     resume_path = save_checkpoint(payload, tmp_path, "resume.pt")
     stage2["checkpoint"]["init_from"] = None
     stage2["checkpoint"]["resume"] = str(resume_path)

@@ -8,7 +8,9 @@ import torch.multiprocessing as mp
 import torch.nn as nn
 
 from distributed import (
+    DistributedContext,
     DistributedEvalSampler,
+    EpochMetricMeter,
     all_reduce_confusion_matrix,
     cleanup_distributed,
     reduce_metric_dict,
@@ -61,13 +63,65 @@ def _gloo_worker(
         assert context.device.type == "cpu"
         assert float(reduce_scalar(rank + 1.0, context, "mean")) == 1.5
         assert float(reduce_scalar(rank + 1.0, context, "max")) == 2.0
+        local_negative = -3.0 if rank == 0 else -1.0
+        assert float(reduce_scalar(local_negative, context, "min")) == -3.0
+        assert float(reduce_scalar(local_negative, context, "max")) == -1.0
+        assert float(reduce_scalar(local_negative, context, "mean")) == -2.0
         reduced = reduce_metric_dict(
-            {"mean_value": rank + 1.0, "max_value": rank + 1.0},
+            {
+                "esd_log_arg_min": local_negative,
+                "esd_teacher_max": 0.25 if rank == 0 else 0.75,
+                "esd_clamp_ratio": 0.2 if rank == 0 else 0.6,
+            },
             context,
-            max_keys={"max_value"},
+            min_keys={"esd_log_arg_min"},
+            max_keys={"esd_teacher_max"},
         )
-        assert float(reduced["mean_value"]) == 1.5
-        assert float(reduced["max_value"]) == 2.0
+        assert float(reduced["esd_log_arg_min"]) == -3.0
+        assert float(reduced["esd_teacher_max"]) == 0.75
+        assert float(reduced["esd_clamp_ratio"]) == pytest.approx(0.4)
+
+        epoch_meter = EpochMetricMeter(
+            min_keys={"esd_log_arg_min"},
+            max_keys={"esd_teacher_max"},
+        )
+        if rank == 0:
+            epoch_meter.update({
+                "esd_log_arg_min": -3.0,
+                "esd_teacher_max": 0.4,
+                "loss_esd": 0.2,
+            })
+            epoch_meter.update({
+                "esd_log_arg_min": -2.0,
+                "esd_teacher_max": 0.5,
+                "loss_esd": 0.4,
+            })
+        else:
+            epoch_meter.update({
+                "esd_log_arg_min": -1.0,
+                "esd_teacher_max": 0.7,
+                "loss_esd": 0.6,
+            })
+            epoch_meter.update({
+                "esd_log_arg_min": -4.0,
+                "esd_teacher_max": 0.6,
+                "loss_esd": 0.8,
+            })
+        local_epoch = epoch_meter.compute()
+        assert local_epoch["esd_log_arg_min"] == (-3.0 if rank == 0 else -4.0)
+        assert local_epoch["esd_teacher_max"] == (0.5 if rank == 0 else 0.7)
+        assert local_epoch["loss_esd"] == pytest.approx(
+            0.3 if rank == 0 else 0.7
+        )
+        global_epoch = reduce_metric_dict(
+            local_epoch,
+            context,
+            min_keys={"esd_log_arg_min"},
+            max_keys={"esd_teacher_max"},
+        )
+        assert float(global_epoch["esd_log_arg_min"]) == -4.0
+        assert float(global_epoch["esd_teacher_max"]) == pytest.approx(0.7)
+        assert float(global_epoch["loss_esd"]) == pytest.approx(0.5)
 
         local_confusion = torch.zeros(3, 3, dtype=torch.int64)
         local_confusion[rank, rank] = rank + 1
@@ -148,3 +202,27 @@ def test_global_batch_size_divisibility():
     assert validate_global_batch_size(4, 2) == 2
     with pytest.raises(ValueError, match="must be divisible"):
         validate_global_batch_size(5, 2)
+
+
+def test_reduction_keys_cannot_be_both_min_and_max():
+    context = DistributedContext(
+        distributed=False,
+        rank=0,
+        local_rank=0,
+        world_size=1,
+        device=torch.device("cpu"),
+        is_main_process=True,
+        backend=None,
+    )
+    with pytest.raises(ValueError, match="both min and max"):
+        reduce_metric_dict(
+            {"metric": 1.0},
+            context,
+            min_keys={"metric"},
+            max_keys={"metric"},
+        )
+    with pytest.raises(ValueError, match="both min and max"):
+        EpochMetricMeter(
+            min_keys={"metric"},
+            max_keys={"metric"},
+        )

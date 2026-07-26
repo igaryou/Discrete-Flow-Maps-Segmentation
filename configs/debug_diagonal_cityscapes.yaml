@@ -107,6 +107,10 @@ loss:
     psd: {}
     csd: {}
     ecld: {ec_weight: 4.0, td_weight: 2.0, time_weighting: none}
+    esd:
+      formulation: stabilized_logit_space
+      source: discrete_flow_maps
+      additional_numerical_safeguards: true
     adaptive_kl: {enabled: false, c: 1.0e-6, r: 0.5, normalize_mean: true, max_weight: 100.0}
     invalid_teacher: {strategy: mask_pixel, log_eps: 1.0e-6, skip_batch_threshold: null}
 checkpoint:

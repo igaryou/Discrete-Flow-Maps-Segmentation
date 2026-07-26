@@ -148,6 +148,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "td_weight": 2.0,
                 "time_weighting": "none",
             },
+            "esd": {
+                "formulation": "stabilized_logit_space",
+                "source": "discrete_flow_maps",
+                "additional_numerical_safeguards": True,
+            },
             "adaptive_kl": {
                 "enabled": False,
                 "c": 1.0e-6,
@@ -332,6 +337,18 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         )
     if consistency["ecld"]["time_weighting"] not in {"none", "inverse_square"}:
         raise ValueError("ECLD time_weighting must be none or inverse_square")
+    if consistency["type"] == "esd":
+        esd = consistency["esd"]
+        if esd["formulation"] != "stabilized_logit_space":
+            raise ValueError(
+                "ESD formulation must be stabilized_logit_space"
+            )
+        if esd["source"] != "discrete_flow_maps":
+            raise ValueError("ESD source must be discrete_flow_maps")
+        if not isinstance(esd["additional_numerical_safeguards"], bool):
+            raise ValueError(
+                "ESD additional_numerical_safeguards must be a boolean"
+            )
     if stage == "diagonal_pretrain" and consistency["enabled"]:
         raise ValueError("Stage 1 must not enable a consistency loss")
     if stage in {"consistency_distillation", "esd_distillation"}:
