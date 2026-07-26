@@ -19,13 +19,22 @@ ROOT = Path(__file__).parents[1]
 class TinyEndpoint(nn.Module):
     def __init__(self, classes=4):
         super().__init__()
-        self.projection = nn.Conv2d(classes + 3, classes, 1)
+        self.projection = nn.Conv2d(classes, classes, 1)
+        self.image_encoder = nn.Conv2d(3, classes, 1)
         self.time_scale = nn.Parameter(torch.zeros(classes))
 
-    def forward_logits(self, x, image, s, t):
-        return self.projection(torch.cat([x, image], dim=1)) + (
+    def encode_image(self, image):
+        return self.image_encoder(image)
+
+    def forward_logits_with_image_feat(self, x, image_feat, s, t):
+        return self.projection(x) + image_feat + (
             s + t
         )[:, None, None, None] * self.time_scale[None, :, None, None]
+
+    def forward_logits(self, x, image, s, t):
+        return self.forward_logits_with_image_feat(
+            x, self.encode_image(image), s, t
+        )
 
 
 def _config(loss_type: str, stage: str = "joint_training"):

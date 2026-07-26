@@ -98,7 +98,10 @@ def _forward_logits(
     image: torch.Tensor,
     s: torch.Tensor,
     t: torch.Tensor,
+    image_feat: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if image_feat is not None:
+        return model.forward_logits_with_image_feat(x, image_feat, s, t)
     return model.forward_logits(x, image, s, t)
 
 
@@ -132,6 +135,7 @@ def _psd_loss(
     model,
     x_s: torch.Tensor,
     image: torch.Tensor,
+    image_feat: torch.Tensor | None,
     s: torch.Tensor,
     u: torch.Tensor,
     t: torch.Tensor,
@@ -141,13 +145,18 @@ def _psd_loss(
 ) -> ConsistencyResult:
     if not bool(((s < u) & (u < t)).all()):
         raise ValueError("PSD requires s < u < t")
+    teacher_image_feat = image_feat.detach() if image_feat is not None else None
     with torch.no_grad():
-        logits_su = _forward_logits(model, x_s, image, s, u)
+        logits_su = _forward_logits(
+            model, x_s, image, s, u, image_feat=teacher_image_feat
+        )
         probability_su = _normalize_probability(
             torch.softmax(logits_su.float(), dim=1), probability_eps
         )
         x_su = flow(x_s.float(), probability_su, s, u, time_eps)
-        logits_ut = _forward_logits(model, x_su, image, u, t)
+        logits_ut = _forward_logits(
+            model, x_su, image, u, t, image_feat=teacher_image_feat
+        )
         probability_ut = _normalize_probability(
             torch.softmax(logits_ut.float(), dim=1), probability_eps
         )
@@ -160,7 +169,9 @@ def _psd_loss(
         )
         teacher = _normalize_probability(teacher, probability_eps).detach()
 
-    student_logits = _forward_logits(model, x_s, image, s, t).float()
+    student_logits = _forward_logits(
+        model, x_s, image, s, t, image_feat=image_feat
+    ).float()
     student_log_probability = F.log_softmax(student_logits, dim=1)
     student_probability = student_log_probability.exp()
     loss = -(teacher * student_log_probability).sum(dim=1).mean().float()
@@ -194,6 +205,7 @@ def _csd_loss(
     model,
     x_s: torch.Tensor,
     image: torch.Tensor,
+    image_feat: torch.Tensor | None,
     s: torch.Tensor,
     t: torch.Tensor,
     time_eps: float,
@@ -205,9 +217,15 @@ def _csd_loss(
     s32, t32 = s.float(), t.float()
     x_primal = x_s.to(dtype=target_dtype)
     image_primal = _precision_image(image, jvp_dtype)
+    image_feat_primal = (
+        image_feat.to(dtype=target_dtype) if image_feat is not None else None
+    )
     with _jvp_autocast(x_s, jvp_dtype):
         def transported_at(t_in: torch.Tensor) -> torch.Tensor:
-            logits = _forward_logits(model, x_primal, image_primal, s32, t_in)
+            logits = _forward_logits(
+                model, x_primal, image_primal, s32, t_in,
+                image_feat=image_feat_primal,
+            )
             logits = logits.to(dtype=target_dtype)
             probability = torch.softmax(logits, dim=1).to(dtype=target_dtype)
             return flow(x_primal, probability, s32, t_in, time_eps).to(target_dtype)
@@ -221,9 +239,13 @@ def _csd_loss(
         derivative = derivative_before.float()
     with torch.no_grad():
         teacher_input = transported.detach().to(dtype=target_dtype)
+        teacher_image_feat = (
+            image_feat_primal.detach() if image_feat_primal is not None else None
+        )
         with _jvp_autocast(x_s, jvp_dtype):
             teacher_logits_before = _forward_logits(
-                model, teacher_input, image_primal, t32, t32
+                model, teacher_input, image_primal, t32, t32,
+                image_feat=teacher_image_feat,
             ).to(dtype=target_dtype)
         with _disabled_autocast(x_s):
             teacher = _normalize_probability(
@@ -266,6 +288,7 @@ def _ecld_loss(
     model,
     x_s: torch.Tensor,
     image: torch.Tensor,
+    image_feat: torch.Tensor | None,
     s: torch.Tensor,
     t: torch.Tensor,
     time_eps: float,
@@ -280,10 +303,14 @@ def _ecld_loss(
     s32, t32 = s.float(), t.float()
     x_primal = x_s.to(dtype=target_dtype)
     image_primal = _precision_image(image, jvp_dtype)
+    image_feat_primal = (
+        image_feat.to(dtype=target_dtype) if image_feat is not None else None
+    )
     with _jvp_autocast(x_s, jvp_dtype):
         def logits_at(t_in: torch.Tensor) -> torch.Tensor:
             return _forward_logits(
-                model, x_primal, image_primal, s32, t_in
+                model, x_primal, image_primal, s32, t_in,
+                image_feat=image_feat_primal,
             ).to(target_dtype)
 
         logits_before, derivative_before = jvp(
@@ -301,9 +328,13 @@ def _ecld_loss(
         )
     with torch.no_grad():
         teacher_input = transported.detach().to(dtype=target_dtype)
+        teacher_image_feat = (
+            image_feat_primal.detach() if image_feat_primal is not None else None
+        )
         with _jvp_autocast(x_s, jvp_dtype):
             teacher_logits_before = _forward_logits(
-                model, teacher_input, image_primal, t32, t32
+                model, teacher_input, image_primal, t32, t32,
+                image_feat=teacher_image_feat,
             ).to(target_dtype)
         with _disabled_autocast(x_s):
             teacher = _normalize_probability(
@@ -360,6 +391,7 @@ def _esd_loss(
     model,
     x_s: torch.Tensor,
     image: torch.Tensor,
+    image_feat: torch.Tensor | None,
     s: torch.Tensor,
     t: torch.Tensor,
     time_eps: float,
@@ -379,11 +411,18 @@ def _esd_loss(
     s32, t32 = s.float(), t.float()
     x32 = x_s.float()
     image_primal = _precision_image(image, jvp_dtype)
+    image_feat_primal = (
+        image_feat.to(dtype=target_dtype) if image_feat is not None else None
+    )
+    teacher_image_feat = (
+        image_feat_primal.detach() if image_feat_primal is not None else None
+    )
 
     with torch.no_grad():
         with _jvp_autocast(x_s, jvp_dtype):
             logits_ss_before = _forward_logits(
-                model, x32.to(target_dtype), image_primal, s32, s32
+                model, x32.to(target_dtype), image_primal, s32, s32,
+                image_feat=teacher_image_feat,
             ).to(target_dtype)
         with _disabled_autocast(x_s):
             logits_ss = logits_ss_before.float()
@@ -398,7 +437,8 @@ def _esd_loss(
     with _jvp_autocast(x_s, jvp_dtype):
         def logits_along_flow(x_in: torch.Tensor, s_in: torch.Tensor) -> torch.Tensor:
             return _forward_logits(
-                model, x_in, image_primal, s_in, t32
+                model, x_in, image_primal, s_in, t32,
+                image_feat=image_feat_primal,
             ).to(target_dtype)
 
         logits_before, directional_before = jvp(
@@ -549,6 +589,7 @@ def compute_consistency_loss(
     model,
     x_s: torch.Tensor,
     image: torch.Tensor,
+    image_feat: torch.Tensor | None = None,
     s: torch.Tensor,
     t: torch.Tensor,
     u: torch.Tensor | None = None,
@@ -579,19 +620,20 @@ def compute_consistency_loss(
         if u is None:
             raise ValueError("PSD requires intermediate time u")
         result = _psd_loss(
-            model=model, x_s=x_s, image=image, s=s, u=u, t=t,
+            model=model, x_s=x_s, image=image, image_feat=image_feat,
+            s=s, u=u, t=t,
             time_eps=time_eps, probability_eps=probability_eps, flow=flow,
         )
     elif loss_type == "csd":
         result = _csd_loss(
-            model=model, x_s=x_s, image=image, s=s, t=t,
+            model=model, x_s=x_s, image=image, image_feat=image_feat, s=s, t=t,
             time_eps=time_eps, probability_eps=probability_eps,
             jvp_dtype=jvp_dtype, flow=flow,
         )
     elif loss_type == "ecld":
         ecld = consistency.get("ecld", {})
         result = _ecld_loss(
-            model=model, x_s=x_s, image=image, s=s, t=t,
+            model=model, x_s=x_s, image=image, image_feat=image_feat, s=s, t=t,
             time_eps=time_eps, probability_eps=probability_eps,
             jvp_dtype=jvp_dtype,
             ec_weight=float(ecld.get("ec_weight", 4.0)),
@@ -603,7 +645,7 @@ def compute_consistency_loss(
         invalid = consistency.get("invalid_teacher", {})
         adaptive = consistency.get("adaptive_kl", {})
         result = _esd_loss(
-            model=model, x_s=x_s, image=image, s=s, t=t,
+            model=model, x_s=x_s, image=image, image_feat=image_feat, s=s, t=t,
             time_eps=time_eps,
             log_eps=float(invalid.get("log_eps", 1.0e-6)),
             invalid_strategy=invalid.get("strategy", "mask_pixel"),
@@ -647,9 +689,10 @@ def esd_loss(
     adaptive_normalize_mean: bool = True,
     adaptive_max_weight: float | None = 100.0,
     jvp_dtype: str = "fp32",
+    image_feat: torch.Tensor | None = None,
 ) -> ESDResult:
     result = _esd_loss(
-        model=model, x_s=x_s, image=image, s=s, t=t,
+        model=model, x_s=x_s, image=image, image_feat=image_feat, s=s, t=t,
         time_eps=time_eps, log_eps=log_eps,
         invalid_strategy=invalid_strategy,
         skip_batch_threshold=skip_batch_threshold,

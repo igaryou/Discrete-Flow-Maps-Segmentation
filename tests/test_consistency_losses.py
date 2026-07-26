@@ -16,12 +16,20 @@ class TinyFlowModel(nn.Module):
         self.image_projection = nn.Conv2d(3, classes, 1)
         self.time_scale = nn.Parameter(torch.linspace(-0.2, 0.2, classes))
 
-    def forward_logits(self, x, image, s, t):
+    def encode_image(self, image):
+        return self.image_projection(image)
+
+    def forward_logits_with_image_feat(self, x, image_feat, s, t):
         time = (0.3 * s + 0.7 * t)[:, None, None, None]
         return (
             self.x_projection(x)
-            + self.image_projection(image)
+            + image_feat
             + time * self.time_scale[None, :, None, None]
+        )
+
+    def forward_logits(self, x, image, s, t):
+        return self.forward_logits_with_image_feat(
+            x, self.encode_image(image), s, t
         )
 
 

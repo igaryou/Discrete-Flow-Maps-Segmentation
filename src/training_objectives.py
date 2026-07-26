@@ -40,6 +40,7 @@ def compute_model_training_objectives(
     batch_size = image.shape[0]
 
     x0, source_stats = sample_prior(config, image, one_hot, source)
+    image_feat = endpoint.encode_image(image)
     zero = _zero(image)
     consistency_result = None
     u = None
@@ -83,19 +84,27 @@ def compute_model_training_objectives(
             * schedule_weight
         )
 
-    diagonal_logits = endpoint.forward_logits(
-        diagonal_state, image, diagonal_time, diagonal_time
+    diagonal_logits = endpoint.forward_logits_with_image_feat(
+        diagonal_state, image_feat, diagonal_time, diagonal_time
     )
     diagonal_loss = losses.diagonal_cross_entropy(
         diagonal_logits, target, training["label_smoothing"]
     ).float()
 
     if operation != "stage1_objectives":
+        consistency_image_feat = image_feat
+        if (
+            consistency_config["precision"].get("jvp_dtype") == "fp32"
+            and image_feat.dtype != torch.float32
+        ):
+            with torch.autocast(device_type=image.device.type, enabled=False):
+                consistency_image_feat = endpoint.encode_image(image.float())
         consistency_result = losses.compute_consistency_loss(
             consistency_config["type"],
             model=endpoint,
             x_s=consistency_state,
             image=image,
+            image_feat=consistency_image_feat,
             s=consistency_s,
             u=u,
             t=consistency_t,
@@ -181,4 +190,3 @@ class DDPCompatibleTrainingModel(nn.Module):
 def run_model_training_objectives(model: nn.Module, *, operation: str, **kwargs):
     """Never unwrap DDP here: the training graph must enter through DDP.forward."""
     return model(operation=operation, **kwargs)
-
