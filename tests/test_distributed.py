@@ -13,6 +13,8 @@ from distributed import (
     EpochMetricMeter,
     all_reduce_confusion_matrix,
     cleanup_distributed,
+    reduce_epoch_metric_meter,
+    reduce_max_values,
     reduce_metric_dict,
     reduce_scalar,
     setup_distributed,
@@ -113,15 +115,26 @@ def _gloo_worker(
         assert local_epoch["loss_esd"] == pytest.approx(
             0.3 if rank == 0 else 0.7
         )
-        global_epoch = reduce_metric_dict(
-            local_epoch,
-            context,
-            min_keys={"esd_log_arg_min"},
-            max_keys={"esd_teacher_max"},
-        )
+        global_epoch = reduce_epoch_metric_meter(epoch_meter, context)
         assert float(global_epoch["esd_log_arg_min"]) == -4.0
         assert float(global_epoch["esd_teacher_max"]) == pytest.approx(0.7)
         assert float(global_epoch["loss_esd"]) == pytest.approx(0.5)
+
+        weighted_meter = EpochMetricMeter()
+        if rank == 0:
+            weighted_meter.update({"metric": 1.0})
+            weighted_meter.update({"metric": 3.0})
+        else:
+            weighted_meter.update({"metric": 9.0})
+        weighted = reduce_epoch_metric_meter(weighted_meter, context)
+        assert float(weighted["metric"]) == pytest.approx(13.0 / 3.0)
+        maxima = reduce_max_values(
+            [float(rank + 1), float(10 - rank)],
+            context,
+        )
+        torch.testing.assert_close(
+            maxima.cpu(), torch.tensor([2.0, 10.0], dtype=torch.float64)
+        )
 
         local_confusion = torch.zeros(3, 3, dtype=torch.int64)
         local_confusion[rank, rank] = rank + 1

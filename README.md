@@ -243,7 +243,11 @@ gradientを持ちません。
 学習DataLoaderは`DistributedSampler`を使い、各epochで`set_epoch(epoch)`を
 呼びます。gradient accumulation中のoptimizer stepを行わないmicro stepは
 `no_sync()`を使い、epoch末または`max_iterations`末の端数もstepします。
-schedulerはoptimizer stepと同期します。
+schedulerはCFMと同じepoch時間軸です。warm-upは`LinearLR`、その後は
+`CosineAnnealingLR`を使い、各epochのsummary記録後に1回だけstepします。
+同一epoch内のLRは一定で、source parameter groupにもmodel groupと同じ倍率を
+適用します。`training.log_interval`は旧iterationログ用のdeprecated設定として
+読み込み互換性のために残しますが、学習時には使用しません。
 
 ### Global batch size
 
@@ -289,14 +293,17 @@ uv run torchrun \
 
 rank 0だけがwandbを初期化・記録し、通常ログ、`metrics.jsonl`、
 `config_resolved.yaml`、checkpoint、可視化、evaluation JSONを書きます。
-iteration統計はrank間でmeanまたは、最大絶対値・最大時間についてmax reduction
-してから記録します。GPU peakはrank別リスト、rank平均、rank最大を保存します。
+学習統計は各rankでepoch中にdetach済みtensorとして蓄積し、epoch終了時だけ
+mean/min/maxをまとめてreduceします。iteration recordは保存しません。
+W&B学習metricと`train_log.txt`も1 epochにつき1回です。GPU peakはrank別リスト、
+rank平均、rank最大を保存します。
 
 checkpoint保存の前後にbarrierを置き、state dictには`module.` prefixを付けません。
 保存内容はstage、epoch、global step、model、source model、optimizer、
-scheduler、scaler、resolved config、model signature、metrics、world size、
-global/local batchです。resumeは完全復元し、world size変更は許容します。
+scheduler、scheduler step unit/version、scaler、resolved config、model signature、
+metrics、world size、global/local batchです。resumeは完全復元し、world size変更は許容します。
 global batch変更時は警告します。旧`module.`付きstate dictもload時に除去します。
+旧optimizer-step scheduler checkpointはLRを誤復元しないよう明示的に拒否します。
 
 `init_from`はStage 1のmodel/source重みだけを読み、optimizer等を初期化します。
 joint checkpointは`stage: joint_training`で、joint同士だけresume可能です。

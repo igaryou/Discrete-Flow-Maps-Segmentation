@@ -137,19 +137,27 @@ def sample_prior(
         x0 = torch.randn(
             batch, classes, height, width, device=image.device, dtype=dtype
         ) * source["prior_noise_std"]
-        return x0, {
+        stats = {
             "loss_source_var": zero, "loss_source_align": zero,
             "weighted_var": zero, "weighted_align": zero,
+            "source_x0_abs": x0.detach().abs().mean(),
         }
+        if target_one_hot is not None:
+            stats["target_x1_abs"] = target_one_hot.detach().abs().mean()
+        return x0, stats
     if source["prior_type"] == "dirichlet":
         concentration = torch.ones(classes, device=image.device, dtype=torch.float32)
         x0 = torch.distributions.Dirichlet(concentration).sample(
             (batch, height, width)
         ).permute(0, 3, 1, 2).to(dtype=dtype)
-        return x0, {
+        stats = {
             "loss_source_var": zero, "loss_source_align": zero,
             "weighted_var": zero, "weighted_align": zero,
+            "source_x0_abs": x0.detach().abs().mean(),
         }
+        if target_one_hot is not None:
+            stats["target_x1_abs"] = target_one_hot.detach().abs().mean()
+        return x0, stats
     if source_model is None:
         raise RuntimeError("source.prior_type=image_gaussian requires a source model")
 
@@ -177,7 +185,8 @@ def sample_prior(
         loss_align = torch.nn.functional.mse_loss(mu_norm, target_norm)
     else:
         loss_align = zero
-    return x0, {
+    sigma = torch.exp(0.5 * logvar.detach())
+    stats = {
         "loss_source_var": loss_var,
         "loss_source_align": loss_align,
         "weighted_var": source["var_weight"] * loss_var,
@@ -185,8 +194,15 @@ def sample_prior(
             source["align_weight"] * loss_align if source["use_loss_align"] else zero
         ),
         "source_mu_abs": mu.detach().abs().mean(),
+        "source_mu_min": mu.detach().amin(),
+        "source_mu_max": mu.detach().amax(),
         "source_logvar_mean": logvar.detach().mean(),
+        "source_sigma_mean": sigma.mean(),
+        "source_x0_abs": x0.detach().abs().mean(),
     }
+    if target_one_hot is not None:
+        stats["target_x1_abs"] = target_one_hot.detach().abs().mean()
+    return x0, stats
 
 
 def make_time_grid(num_steps: int, device: torch.device) -> list[tuple[torch.Tensor, torch.Tensor]]:

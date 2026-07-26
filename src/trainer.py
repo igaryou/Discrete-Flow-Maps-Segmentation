@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import math
 import time
 from contextlib import nullcontext
@@ -28,7 +27,8 @@ from distributed import (
     barrier,
     cleanup_distributed,
     parameter_checksum,
-    reduce_metric_dict,
+    reduce_epoch_metric_meter,
+    reduce_max_values,
     reduce_scalar,
     seed_data_loader_worker,
     setup_distributed,
@@ -62,89 +62,65 @@ MAX_REDUCTION_KEYS = {
     "csd_jvp_output_abs_max",
     "ecld_jvp_output_abs_max",
     "esd_teacher_max",
+    "source_mu_max",
     "s_max",
     "t_max",
-    "runtime_iteration_time",
 }
 
 MIN_REDUCTION_KEYS = {
     "esd_log_arg_min",
     "esd_teacher_min",
+    "source_mu_min",
     "s_min",
     "t_min",
 }
 
-EPOCH_SUMMARY_OPTIONAL_KEYS = (
-    "loss_psd",
-    "psd_teacher_entropy",
-    "loss_csd",
-    "csd_residual_norm",
-    "loss_ecld",
-    "loss_ecld_ec",
-    "loss_ecld_td",
-    "ecld_dt_prob_norm",
-    "loss_esd",
-    "esd_teacher_entropy",
-    "esd_clamp_ratio",
-    "esd_pixel_invalid_ratio",
-    "esd_sample_invalid_ratio",
-    "esd_nonfinite_ratio",
-    "esd_skipped_batch",
-    "loss_source_var",
-    "loss_source_align",
-    "weighted_var",
-    "weighted_align",
-    "source_mu_abs",
-    "source_logvar_mean",
+CONSISTENCY_SUMMARY_KEYS = {
+    "psd": ("loss_psd", "psd_teacher_entropy"),
+    "csd": ("loss_csd", "csd_residual_norm"),
+    "ecld": (
+        "loss_ecld",
+        "loss_ecld_ec",
+        "loss_ecld_td",
+        "ecld_dt_prob_norm",
+    ),
+    "esd": (
+        "loss_esd",
+        "esd_teacher_entropy",
+        "esd_clamp_ratio",
+        "esd_pixel_invalid_ratio",
+        "esd_sample_invalid_ratio",
+    ),
+}
+
+SOURCE_SUMMARY_ALIASES = (
+    ("loss_var", "loss_source_var"),
+    ("loss_align", "loss_source_align"),
+    ("weighted_var", "weighted_var"),
+    ("weighted_align", "weighted_align"),
+    ("mu_abs", "source_mu_abs"),
+    ("mu_min", "source_mu_min"),
+    ("mu_max", "source_mu_max"),
+    ("logvar_mean", "source_logvar_mean"),
+    ("sigma_mean", "source_sigma_mean"),
+    ("x0_abs", "source_x0_abs"),
+    ("x1_abs", "target_x1_abs"),
 )
-
-
-class _DisplayRunningMeans:
-    """Small rank-local accumulator used only for terminal presentation."""
-
-    KEYS = (
-        "loss_total",
-        "loss_diagonal",
-        "loss_consistency",
-        "runtime_iteration_time",
-    )
-
-    def __init__(self) -> None:
-        self.sums = {key: 0.0 for key in self.KEYS}
-        self.counts = {key: 0 for key in self.KEYS}
-
-    def update(self, metrics: dict) -> None:
-        for key in self.KEYS:
-            value = metrics.get(key)
-            if torch.is_tensor(value):
-                if value.numel() != 1:
-                    continue
-                scalar = float(value.detach().float().cpu())
-            elif isinstance(value, (int, float)):
-                scalar = float(value)
-            else:
-                continue
-            if math.isfinite(scalar):
-                self.sums[key] += scalar
-                self.counts[key] += 1
-
-    def means(self) -> dict[str, float]:
-        return {
-            key: self.sums[key] / count
-            for key, count in self.counts.items()
-            if count
-        }
 
 
 def _epoch_total_iterations(
     loader_length: int,
     max_iterations: int | None,
     total_iterations: int,
+    max_batches_per_epoch: int | None = None,
 ) -> int:
-    if max_iterations is None:
-        return loader_length
-    remaining_iterations = max(max_iterations - total_iterations, 0)
-    return min(loader_length, remaining_iterations)
+    total = loader_length
+    if max_iterations is not None:
+        remaining_iterations = max(max_iterations - total_iterations, 0)
+        total = min(total, remaining_iterations)
+    if max_batches_per_epoch is not None:
+        total = min(total, max_batches_per_epoch)
+    return total
 
 
 def _create_epoch_progress(
@@ -165,89 +141,164 @@ def _create_epoch_progress(
     )
 
 
-def _gpu_memory_gb(device: torch.device) -> float | None:
-    if device.type != "cuda":
-        return None
-    return torch.cuda.memory_reserved(device) / 1024**3
+def _parameter_group_lr(optimizer, name: str) -> float | None:
+    for group in optimizer.param_groups:
+        if group.get("name") == name:
+            return float(group["lr"])
+    return None
 
 
-def _progress_postfix(
-    running_means: dict[str, float],
-    *,
-    consistency_type: str,
-    lr: float,
-    sec_per_batch: float,
-    memory_gb: float | None,
-) -> dict[str, str]:
-    postfix = {
-        "loss": f"{running_means['loss_total']:.4f}",
-        "diag": f"{running_means['loss_diagonal']:.4f}",
-        consistency_type: f"{running_means['loss_consistency']:.4f}",
-        "lr": f"{lr:.3e}",
-        "sec/batch": f"{sec_per_batch:.2f}",
-    }
-    if memory_gb is not None:
-        postfix["mem"] = f"{memory_gb:.1f}G"
-    return postfix
-
-
-def _format_epoch_summary(
+def _build_epoch_report(
     *,
     epoch: int,
     reduced_epoch: dict[str, torch.Tensor | float],
     consistency_type: str,
-    sec_per_batch: float | None = None,
-) -> str:
+    primary_weight: float,
+    local_batch_size: int,
+    global_batch_size: int,
+    grad_accum_steps: int,
+    optimizer_step: int,
+    processed_batches: int,
+    optimizer_updates: int,
+    elapsed_seconds: float,
+    rank0_peak_allocated_mb: float,
+    max_peak_allocated_mb: float,
+    rank0_peak_reserved_mb: float,
+    max_peak_reserved_mb: float,
+    epoch_lr: float,
+    epoch_source_lr: float | None,
+) -> dict[str, float | int | str]:
     required = (
         "loss_total",
         "loss_diagonal",
         "loss_consistency",
         "consistency_effective_weight",
-        "lr",
     )
     missing = [key for key in required if key not in reduced_epoch]
     if missing:
         raise KeyError(f"Missing required epoch summary metrics: {missing}")
 
     loss_total = float(reduced_epoch["loss_total"])
-    fields = [
-        f"epoch:{epoch}",
-        f"loss_avg:{loss_total:.6f}",
-        f"loss_total:{loss_total:.6f}",
-        f"loss_primary:{float(reduced_epoch['loss_diagonal']):.6f}",
-        f"loss_consistency:{float(reduced_epoch['loss_consistency']):.6f}",
-        f"consistency_type:{consistency_type}",
-        (
-            "consistency_weight:"
-            f"{float(reduced_epoch['consistency_effective_weight']):.6f}"
-        ),
-    ]
-    fields.extend(
-        f"{key}:{float(reduced_epoch[key]):.6f}"
-        for key in EPOCH_SUMMARY_OPTIONAL_KEYS
-        if key in reduced_epoch
+    loss_primary = float(reduced_epoch["loss_diagonal"])
+    loss_consistency = float(reduced_epoch["loss_consistency"])
+    consistency_weight = float(reduced_epoch["consistency_effective_weight"])
+    loss_base = (
+        primary_weight * loss_primary
+        + consistency_weight * loss_consistency
     )
-    fields.append(f"lr:{float(reduced_epoch['lr']):.6e}")
-    if sec_per_batch is None and "runtime_iteration_time" in reduced_epoch:
-        sec_per_batch = float(reduced_epoch["runtime_iteration_time"])
-    if sec_per_batch is None:
-        raise KeyError("Missing required epoch summary metric: sec_per_batch")
-    fields.append(f"sec_per_batch:{sec_per_batch:.6f}")
+    elapsed = max(elapsed_seconds, 1.0e-12)
+    report: dict[str, float | int | str] = {
+        "epoch": epoch,
+        "loss_avg": loss_total,
+        "loss_base": loss_base,
+        "inf": loss_primary,
+        "distill": loss_consistency,
+        "loss_total": loss_total,
+        "loss_primary": loss_primary,
+        "loss_consistency": loss_consistency,
+        "distill_type": consistency_type,
+        "consistency_loss_type": consistency_type,
+        "consistency_weight": consistency_weight,
+    }
+    if consistency_type == "ecld":
+        if "loss_ecld_ec" in reduced_epoch:
+            report["ce_ec"] = float(reduced_epoch["loss_ecld_ec"])
+        if "loss_ecld_td" in reduced_epoch:
+            report["td"] = float(reduced_epoch["loss_ecld_td"])
+    for output_key, metric_key in SOURCE_SUMMARY_ALIASES:
+        if metric_key in reduced_epoch:
+            report[output_key] = float(reduced_epoch[metric_key])
+    report.update({
+        "local_batch_size": local_batch_size,
+        "global_batch_size": global_batch_size,
+        "grad_accum_steps": grad_accum_steps,
+        "effective_batch_size": global_batch_size * grad_accum_steps,
+        "optimizer_step": optimizer_step,
+    })
+    if "grad_norm" in reduced_epoch:
+        report["grad_norm"] = float(reduced_epoch["grad_norm"])
+    report.update({
+        "rank0_peak_allocated_mb": rank0_peak_allocated_mb,
+        "max_peak_allocated_mb": max_peak_allocated_mb,
+        "rank0_peak_reserved_mb": rank0_peak_reserved_mb,
+        "max_peak_reserved_mb": max_peak_reserved_mb,
+        "images_per_second": (
+            processed_batches * global_batch_size / elapsed
+        ),
+        "optimizer_updates_per_second": optimizer_updates / elapsed,
+        "sec_per_batch": elapsed / max(processed_batches, 1),
+        "lr": epoch_lr,
+    })
+    if epoch_source_lr is not None:
+        report["source_lr"] = epoch_source_lr
+    for key in CONSISTENCY_SUMMARY_KEYS.get(consistency_type, ()):
+        if key in reduced_epoch:
+            report[key] = float(reduced_epoch[key])
+    return report
+
+
+def _format_epoch_summary(
+    report: dict[str, float | int | str],
+) -> str:
+    fields = []
+    integer_keys = {
+        "epoch",
+        "local_batch_size",
+        "global_batch_size",
+        "grad_accum_steps",
+        "effective_batch_size",
+        "optimizer_step",
+    }
+    memory_keys = {
+        "rank0_peak_allocated_mb",
+        "max_peak_allocated_mb",
+        "rank0_peak_reserved_mb",
+        "max_peak_reserved_mb",
+    }
+    rate_keys = {"images_per_second", "optimizer_updates_per_second"}
+    for key, value in report.items():
+        if isinstance(value, str):
+            rendered = value
+        elif key in integer_keys:
+            rendered = str(int(value))
+        elif key in {"lr", "source_lr"}:
+            rendered = f"{float(value):.8e}"
+        elif key in memory_keys:
+            rendered = f"{float(value):.1f}"
+        elif key in rate_keys:
+            rendered = f"{float(value):.3f}"
+        else:
+            rendered = f"{float(value):.6f}"
+        fields.append(f"{key}:{rendered}")
     return " ".join(fields)
 
 
-def _wandb_iteration_payload(
-    reduced: dict[str, torch.Tensor],
-) -> dict[str, float]:
-    payload: dict[str, float] = {}
-    for key, value in reduced.items():
-        if key == "runtime_iteration_time":
-            name = "runtime/iteration_time"
-        elif key == "runtime_samples_per_second":
-            name = "runtime/samples_per_second"
-        else:
-            name = f"train/{key}"
-        payload[name] = float(value)
+def _wandb_epoch_payload(
+    report: dict[str, float | int | str],
+    consistency_type: str,
+) -> dict[str, float | int]:
+    aliases = {
+        "loss": "loss_avg",
+        "loss_base": "loss_base",
+        "loss_primary": "loss_primary",
+        "loss_consistency": "loss_consistency",
+        "loss_align": "loss_align",
+        "weighted_align": "weighted_align",
+        "lr": "lr",
+        "source_lr": "source_lr",
+        "images_per_second": "images_per_second",
+        "optimizer_updates_per_second": "optimizer_updates_per_second",
+        "grad_norm": "grad_norm",
+        "epoch": "epoch",
+    }
+    payload = {
+        f"epoch/{output_key}": report[report_key]
+        for output_key, report_key in aliases.items()
+        if report_key in report
+    }
+    for key in CONSISTENCY_SUMMARY_KEYS.get(consistency_type, ()):
+        if key in report:
+            payload[f"epoch/{key}"] = report[key]
     return payload
 
 
@@ -320,35 +371,95 @@ def build_optimizer(config: dict, adapter: DDPCompatibleTrainingModel):
     )
 
 
-def build_scheduler(
-    config: dict,
-    optimizer,
-    *,
-    micro_steps_per_epoch: int = 1,
+class _RatioPreservingCosineAnnealingLR(
+    torch.optim.lr_scheduler.CosineAnnealingLR
 ):
+    """CFM cosine schedule with a shared multiplicative floor across groups."""
+
+    def __init__(self, optimizer, T_max: int, eta_min: float):
+        reference_base_lr = float(
+            optimizer.param_groups[0].get(
+                "initial_lr", optimizer.param_groups[0]["lr"]
+            )
+        )
+        eta_ratio = eta_min / reference_base_lr
+        self.eta_mins = [
+            float(group.get("initial_lr", group["lr"])) * eta_ratio
+            for group in optimizer.param_groups
+        ]
+        super().__init__(optimizer, T_max=T_max, eta_min=eta_min)
+
+    def get_lr(self):
+        if self._is_initial:
+            return [group["lr"] for group in self.optimizer.param_groups]
+        if self._step_count == 1 and self.last_epoch > 0:
+            return self._get_closed_form_lr()
+        if (self.last_epoch - 1 - self.T_max) % (2 * self.T_max) == 0:
+            return [
+                group["lr"]
+                + (base_lr - eta_min)
+                * (1 - math.cos(math.pi / self.T_max))
+                / 2
+                for base_lr, eta_min, group in zip(
+                    self.base_lrs,
+                    self.eta_mins,
+                    self.optimizer.param_groups,
+                    strict=True,
+                )
+            ]
+        return [
+            (1 + math.cos(math.pi * self.last_epoch / self.T_max))
+            / (1 + math.cos(math.pi * (self.last_epoch - 1) / self.T_max))
+            * (group["lr"] - eta_min)
+            + eta_min
+            for eta_min, group in zip(
+                self.eta_mins, self.optimizer.param_groups, strict=True
+            )
+        ]
+
+    def _get_closed_form_lr(self):
+        return [
+            eta_min
+            + (base_lr - eta_min)
+            * (1 + math.cos(math.pi * self.last_epoch / self.T_max))
+            / 2
+            for base_lr, eta_min in zip(
+                self.base_lrs, self.eta_mins, strict=True
+            )
+        ]
+
+
+def build_scheduler(config: dict, optimizer):
     scheduler_config = config["training"]["scheduler"]
-    accumulation = config["training"]["grad_accum_steps"]
-    optimizer_steps_per_epoch = math.ceil(micro_steps_per_epoch / accumulation)
-    total_steps = max(config["training"]["epochs"] * optimizer_steps_per_epoch, 1)
-    warmup_steps = scheduler_config["warmup_epochs"] * optimizer_steps_per_epoch
-    base_lr = config["training"]["optimizer"]["lr"]
-    eta_ratio = scheduler_config["eta_min"] / base_lr
 
     if scheduler_config["name"] == "constant":
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
     if scheduler_config["name"] != "cosine":
         raise ValueError(f"Unknown scheduler: {scheduler_config['name']}")
-
-    def multiplier(step_index: int) -> float:
-        if warmup_steps > 0 and step_index < warmup_steps:
-            return max((step_index + 1) / warmup_steps, 1.0 / warmup_steps)
-        progress = (step_index - warmup_steps) / max(total_steps - warmup_steps, 1)
-        progress = min(max(progress, 0.0), 1.0)
-        return eta_ratio + (1.0 - eta_ratio) * 0.5 * (
-            1.0 + math.cos(math.pi * progress)
+    epochs = config["training"]["epochs"]
+    warmup_epochs = scheduler_config["warmup_epochs"]
+    if warmup_epochs <= 0:
+        return _RatioPreservingCosineAnnealingLR(
+            optimizer,
+            T_max=max(epochs, 1),
+            eta_min=scheduler_config["eta_min"],
         )
-
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, multiplier)
+    linear = torch.optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=scheduler_config["warmup_start_factor"],
+        end_factor=1.0,
+        total_iters=warmup_epochs,
+    )
+    cosine = _RatioPreservingCosineAnnealingLR(
+        optimizer,
+        T_max=max(epochs - warmup_epochs, 1),
+        eta_min=scheduler_config["eta_min"],
+    )
+    return torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[linear, cosine],
+        milestones=[warmup_epochs],
+    )
 
 
 def _build_loaders(
@@ -581,10 +692,7 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
         adapter = DDPCompatibleTrainingModel(endpoint, source, config).to(context.device)
         optimizer = build_optimizer(config, adapter)
         max_iterations = config["training"]["max_iterations"]
-        micro_steps = min(len(train_loader), max_iterations) if max_iterations else len(train_loader)
-        scheduler = build_scheduler(
-            config, optimizer, micro_steps_per_epoch=max(micro_steps, 1)
-        )
+        scheduler = build_scheduler(config, optimizer)
         scaler = build_grad_scaler(config, context.device)
         state = initialize_or_resume(
             config, endpoint, source, optimizer, scheduler, scaler,
@@ -605,6 +713,7 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
         metrics_path = output_dir / "metrics.jsonl"
         total_iterations = 0
         last_metrics: dict = {"best_mIoU": state.best_miou}
+        last_epoch_report: dict[str, float | int | str] = {}
         optimizer.zero_grad(set_to_none=True)
 
         for epoch_index in range(state.start_epoch, training["epochs"]):
@@ -618,19 +727,28 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                 min_keys=MIN_REDUCTION_KEYS,
                 max_keys=MAX_REDUCTION_KEYS,
             )
-            display_meter = _DisplayRunningMeans()
+            epoch_lr = float(optimizer.param_groups[0]["lr"])
+            epoch_source_lr = _parameter_group_lr(optimizer, "source")
+            epoch_total_iterations = _epoch_total_iterations(
+                len(train_loader),
+                max_iterations,
+                total_iterations,
+                training["max_batches_per_epoch"],
+            )
+            if epoch_total_iterations <= 0:
+                break
+            processed_batches = 0
+            optimizer_updates_in_epoch = 0
+            epoch_start_time = time.perf_counter()
             progress = _create_epoch_progress(
                 epoch_index=epoch_index,
-                total=_epoch_total_iterations(
-                    len(train_loader), max_iterations, total_iterations
-                ),
+                total=epoch_total_iterations,
                 is_main_process=context.is_main_process,
             )
             try:
                 for batch_index, (image, one_hot, target) in enumerate(train_loader):
-                    if max_iterations is not None and total_iterations >= max_iterations:
+                    if batch_index >= epoch_total_iterations:
                         break
-                    iteration_start = time.perf_counter()
                     image = image.to(context.device, non_blocking=True)
                     one_hot = one_hot.to(context.device, non_blocking=True)
                     target = target.to(context.device, non_blocking=True)
@@ -640,7 +758,7 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                     )
                     should_step = (
                         (batch_index + 1) % training["grad_accum_steps"] == 0
-                        or batch_index + 1 == len(train_loader)
+                        or batch_index + 1 == epoch_total_iterations
                         or reaches_limit
                     )
                     sync_context = (
@@ -666,7 +784,7 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                             )
                         scaler.scale(scaled_loss).backward()
 
-                    grad_norm = torch.zeros((), device=context.device)
+                    grad_norm = None
                     if should_step:
                         scaler.unscale_(optimizer)
                         if training["grad_clip"] is not None:
@@ -676,121 +794,94 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                         scaler.step(optimizer)
                         scaler.update()
                         optimizer.zero_grad(set_to_none=True)
-                        scheduler.step()
                         state.global_step += 1
-                    if context.device.type == "cuda":
-                        torch.cuda.synchronize(context.device)
-                    local_iteration_time = time.perf_counter() - iteration_start
-                    global_iteration_time = reduce_scalar(
-                        local_iteration_time, context, "max"
-                    )
-                    samples_per_second = (
-                        global_batch_size / global_iteration_time.clamp_min(1.0e-9)
-                    )
+                        optimizer_updates_in_epoch += 1
                     total_iterations += 1
+                    processed_batches += 1
                     batch_stats = dict(objectives["stats"])
-                    batch_stats.update({
-                        "lr": optimizer.param_groups[0]["lr"],
-                        "grad_norm": grad_norm.detach(),
-                        "epoch": epoch_index + 1,
-                        "global_step": state.global_step,
-                        "runtime_iteration_time": global_iteration_time,
-                        "runtime_samples_per_second": samples_per_second,
-                    })
+                    if grad_norm is not None:
+                        batch_stats["grad_norm"] = grad_norm.detach()
                     epoch_meter.update(batch_stats)
 
                     if context.is_main_process:
-                        display_meter.update(batch_stats)
-                        progress.set_postfix(
-                            _progress_postfix(
-                                display_meter.means(),
-                                consistency_type=objectives["consistency_type"],
-                                lr=float(batch_stats["lr"]),
-                                sec_per_batch=float(global_iteration_time),
-                                memory_gb=_gpu_memory_gb(context.device),
-                            ),
-                            refresh=False,
-                        )
                         progress.update(1)
-
-                    should_log = (
-                        total_iterations % training["log_interval"] == 0
-                        or total_iterations == 1
-                    )
-                    if should_log:
-                        scalar_stats = {
-                            key: value for key, value in batch_stats.items()
-                            if (
-                                torch.is_tensor(value) and value.numel() == 1
-                            ) or isinstance(value, (int, float))
-                        }
-                        reduced = reduce_metric_dict(
-                            scalar_stats,
-                            context,
-                            min_keys=MIN_REDUCTION_KEYS,
-                            max_keys=MAX_REDUCTION_KEYS,
-                        )
-                        if context.is_main_process:
-                            record = {
-                                "scope": "iteration",
-                                "stage": stage,
-                                "consistency_type": objectives["consistency_type"],
-                                "iteration": total_iterations,
-                                **reduced,
-                            }
-                            append_jsonl(metrics_path, record)
-                            logger.info(
-                                "epoch=%d iter=%d step=%d loss=%.6g diag=%.6g "
-                                "consistency=%.6g type=%s",
-                                epoch_index + 1, total_iterations,
-                                state.global_step,
-                                float(reduced["loss_total"]),
-                                float(reduced["loss_diagonal"]),
-                                float(reduced["loss_consistency"]),
-                                objectives["consistency_type"],
-                                extra={"console": False},
-                            )
-                            if wandb_run is not None:
-                                wandb_run.log(
-                                    _wandb_iteration_payload(reduced),
-                                    step=state.global_step,
-                                )
             finally:
                 if progress is not None:
                     progress.close()
 
-            epoch_values = epoch_meter.compute()
-            epoch_tensors = {
-                key: torch.tensor(value, device=context.device)
-                for key, value in epoch_values.items()
-            }
-            reduced_epoch = reduce_metric_dict(
-                epoch_tensors,
+            if context.device.type == "cuda":
+                torch.cuda.synchronize(context.device)
+                local_peak_allocated_mb = (
+                    torch.cuda.max_memory_allocated(context.device) / 1024**2
+                )
+                local_peak_reserved_mb = (
+                    torch.cuda.max_memory_reserved(context.device) / 1024**2
+                )
+            else:
+                local_peak_allocated_mb = 0.0
+                local_peak_reserved_mb = 0.0
+            local_elapsed_seconds = time.perf_counter() - epoch_start_time
+            runtime_maxima = reduce_max_values(
+                [
+                    local_elapsed_seconds,
+                    local_peak_allocated_mb,
+                    local_peak_reserved_mb,
+                ],
                 context,
-                min_keys=MIN_REDUCTION_KEYS,
-                max_keys=MAX_REDUCTION_KEYS,
             )
+            max_elapsed_seconds = float(runtime_maxima[0].cpu())
+            max_peak_allocated_mb = float(runtime_maxima[1].cpu())
+            max_peak_reserved_mb = float(runtime_maxima[2].cpu())
+            reduced_epoch = reduce_epoch_metric_meter(epoch_meter, context)
+            consistency_type = (
+                "none"
+                if stage == "diagonal_pretrain"
+                else config["loss"]["consistency"]["type"]
+            )
+            epoch_report = _build_epoch_report(
+                epoch=epoch_index + 1,
+                reduced_epoch=reduced_epoch,
+                consistency_type=consistency_type,
+                primary_weight=config["loss"]["primary"]["weight"],
+                local_batch_size=local_batch_size,
+                global_batch_size=global_batch_size,
+                grad_accum_steps=training["grad_accum_steps"],
+                optimizer_step=state.global_step,
+                processed_batches=processed_batches,
+                optimizer_updates=optimizer_updates_in_epoch,
+                elapsed_seconds=max_elapsed_seconds,
+                rank0_peak_allocated_mb=local_peak_allocated_mb,
+                max_peak_allocated_mb=max_peak_allocated_mb,
+                rank0_peak_reserved_mb=local_peak_reserved_mb,
+                max_peak_reserved_mb=max_peak_reserved_mb,
+                epoch_lr=epoch_lr,
+                epoch_source_lr=epoch_source_lr,
+            )
+            raw_epoch_metrics = {
+                key: float(value) for key, value in reduced_epoch.items()
+            }
             if context.is_main_process:
                 append_jsonl(metrics_path, {
-                    "scope": "epoch", "stage": stage,
-                    "consistency_type": config["loss"]["consistency"]["type"],
-                    "epoch": epoch_index + 1, **reduced_epoch,
+                    "scope": "epoch",
+                    "stage": stage,
+                    "consistency_type": consistency_type,
+                    **epoch_report,
+                    **{
+                        key: value
+                        for key, value in raw_epoch_metrics.items()
+                        if key not in epoch_report
+                    },
                 })
-                summary = _format_epoch_summary(
-                    epoch=epoch_index + 1,
-                    reduced_epoch=reduced_epoch,
-                    consistency_type=config["loss"]["consistency"]["type"],
-                    sec_per_batch=display_meter.means().get(
-                        "runtime_iteration_time"
-                    ),
-                )
+                summary = _format_epoch_summary(epoch_report)
                 tqdm.write(summary)
                 logger.info(summary, extra={"console": False})
                 if wandb_run is not None:
-                    wandb_run.log({
-                        f"epoch/train/{key}": float(value)
-                        for key, value in reduced_epoch.items()
-                    } | {"epoch/train/epoch": epoch_index + 1}, step=state.global_step)
+                    wandb_run.log(
+                        _wandb_epoch_payload(epoch_report, consistency_type),
+                        step=state.global_step,
+                    )
+            scheduler.step()
+            last_epoch_report = epoch_report
 
             validation_metrics = None
             if epoch_index + 1 in set(training["validation_epochs"]):
@@ -817,7 +908,8 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                     state.best_miou = validation_metrics["mIoU"]
 
             last_metrics = {
-                **{key: float(value) for key, value in reduced_epoch.items()},
+                **raw_epoch_metrics,
+                **epoch_report,
                 **(validation_metrics or {}),
                 "best_mIoU": state.best_miou,
             }
@@ -865,10 +957,10 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
             "runtime/local_batch_size": local_batch_size,
             "runtime/effective_global_batch_size": effective_global_batch_size,
             "runtime/iteration_time": float(
-                reduced_epoch.get("runtime_iteration_time", torch.tensor(0.0))
+                last_epoch_report.get("sec_per_batch", 0.0)
             ),
             "runtime/samples_per_second": float(
-                reduced_epoch.get("runtime_samples_per_second", torch.tensor(0.0))
+                last_epoch_report.get("images_per_second", 0.0)
             ),
             "runtime/peak_gpu_memory_mb": mean_peak,
             "runtime/max_peak_gpu_memory_mb_across_ranks": max_peak,
@@ -881,11 +973,6 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                 "Peak GPU allocated memory by rank=%s; max=%.2f MiB; checksum_diff=%.3g",
                 rank_peaks, max_peak, checksum_stats["checksum_max_diff"],
             )
-            if wandb_run is not None:
-                wandb_run.log({
-                    key: value for key, value in runtime_stats.items()
-                    if isinstance(value, (int, float))
-                }, step=state.global_step)
         last_metrics.update(runtime_stats)
         return last_metrics
     finally:

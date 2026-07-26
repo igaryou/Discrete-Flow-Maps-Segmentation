@@ -21,6 +21,16 @@ def test_yaml_load_and_cli_override():
     assert config["training"]["batch_size"] == 2
     assert config["runtime"]["device"] == "cpu"
     assert config["flow"]["time_eps"] == 1.0e-5
+    assert config["training"]["scheduler"]["step_unit"] == "epoch"
+    assert config["training"]["scheduler"]["warmup_start_factor"] == 0.1
+    assert config["training"]["max_batches_per_epoch"] is None
+
+
+def test_scheduler_unit_and_debug_epoch_limit_are_validated():
+    with pytest.raises(ValueError, match="step_unit must be epoch"):
+        load_config(CONFIG, ["training.scheduler.step_unit=iteration"])
+    with pytest.raises(ValueError, match="max_batches_per_epoch"):
+        load_config(CONFIG, ["training.max_batches_per_epoch=0"])
 
 
 def test_missing_required_section_has_clear_error(tmp_path):

@@ -231,7 +231,7 @@ def reduce_metric_dict(
 
 
 class EpochMetricMeter:
-    """Track epoch means and true extrema before cross-rank reduction."""
+    """Accumulate detached scalar tensors without synchronizing every batch."""
 
     def __init__(
         self,
@@ -247,36 +247,152 @@ class EpochMetricMeter:
                 "Metric keys cannot use both min and max reduction: "
                 f"{sorted(overlap)}"
             )
-        self.sums: dict[str, float] = {}
-        self.counts: dict[str, int] = {}
-        self.minima: dict[str, float] = {}
-        self.maxima: dict[str, float] = {}
+        self.sums: dict[str, Any] = {}
+        self.counts: dict[str, Any] = {}
+        self.minima: dict[str, Any] = {}
+        self.maxima: dict[str, Any] = {}
 
     def update(self, metrics: Mapping[str, Any]) -> None:
         for key, value in metrics.items():
             if torch.is_tensor(value):
                 if value.numel() != 1:
                     continue
-                scalar = float(value.detach().float().cpu())
+                scalar = value.detach().float()
+                finite = torch.isfinite(scalar)
+                valid_count = finite.to(dtype=torch.float64)
             elif isinstance(value, (int, float)):
                 scalar = float(value)
+                if not math.isfinite(scalar):
+                    continue
+                valid_count = 1
             else:
-                continue
-            if not math.isfinite(scalar):
                 continue
             if key in self.min_keys:
-                self.minima[key] = min(self.minima.get(key, scalar), scalar)
+                if torch.is_tensor(scalar):
+                    scalar = torch.where(
+                        finite, scalar, torch.full_like(scalar, float("inf"))
+                    )
+                    previous = self.minima.get(key)
+                    self.minima[key] = (
+                        scalar.clone()
+                        if previous is None
+                        else torch.minimum(previous, scalar)
+                    )
+                else:
+                    self.minima[key] = min(self.minima.get(key, scalar), scalar)
             elif key in self.max_keys:
-                self.maxima[key] = max(self.maxima.get(key, scalar), scalar)
+                if torch.is_tensor(scalar):
+                    scalar = torch.where(
+                        finite, scalar, torch.full_like(scalar, float("-inf"))
+                    )
+                    previous = self.maxima.get(key)
+                    self.maxima[key] = (
+                        scalar.clone()
+                        if previous is None
+                        else torch.maximum(previous, scalar)
+                    )
+                else:
+                    self.maxima[key] = max(self.maxima.get(key, scalar), scalar)
             else:
-                self.sums[key] = self.sums.get(key, 0.0) + scalar
-                self.counts[key] = self.counts.get(key, 0) + 1
+                if torch.is_tensor(scalar):
+                    scalar = torch.where(finite, scalar, torch.zeros_like(scalar))
+                    previous_sum = self.sums.get(key)
+                    previous_count = self.counts.get(key)
+                    self.sums[key] = (
+                        scalar.clone()
+                        if previous_sum is None
+                        else previous_sum + scalar
+                    )
+                    self.counts[key] = (
+                        valid_count.clone()
+                        if previous_count is None
+                        else previous_count + valid_count
+                    )
+                else:
+                    self.sums[key] = self.sums.get(key, 0.0) + scalar
+                    self.counts[key] = self.counts.get(key, 0) + valid_count
 
     def compute(self) -> dict[str, float]:
-        means = {
-            key: total / self.counts[key] for key, total in self.sums.items()
+        def scalar_float(value: Any) -> float:
+            if torch.is_tensor(value):
+                return float(value.detach().cpu())
+            return float(value)
+
+        means = {}
+        for key, total in self.sums.items():
+            count = scalar_float(self.counts[key])
+            if count > 0:
+                means[key] = scalar_float(total) / count
+        minima = {
+            key: scalar_float(value)
+            for key, value in self.minima.items()
+            if math.isfinite(scalar_float(value))
         }
-        return means | self.minima | self.maxima
+        maxima = {
+            key: scalar_float(value)
+            for key, value in self.maxima.items()
+            if math.isfinite(scalar_float(value))
+        }
+        return means | minima | maxima
+
+
+def _reduction_tensor(value: Any, context: DistributedContext) -> torch.Tensor:
+    if torch.is_tensor(value):
+        return value.detach().to(device=context.device, dtype=torch.float64)
+    return torch.tensor(float(value), device=context.device, dtype=torch.float64)
+
+
+def reduce_epoch_metric_meter(
+    meter: EpochMetricMeter,
+    context: DistributedContext,
+) -> dict[str, torch.Tensor]:
+    """Reduce all epoch means in one SUM, plus one MIN/MAX for extrema."""
+    result: dict[str, torch.Tensor] = {}
+    mean_keys = sorted(meter.sums)
+    if mean_keys:
+        packed = torch.stack(
+            [_reduction_tensor(meter.sums[key], context) for key in mean_keys]
+            + [_reduction_tensor(meter.counts[key], context) for key in mean_keys]
+        )
+        if context.distributed:
+            dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+        sums, counts = packed[:len(mean_keys)], packed[len(mean_keys):]
+        for key, total, count in zip(mean_keys, sums, counts, strict=True):
+            if float(count.detach().cpu()) > 0:
+                result[key] = total / count
+
+    min_keys = sorted(meter.minima)
+    if min_keys:
+        minima = torch.stack([
+            _reduction_tensor(meter.minima[key], context) for key in min_keys
+        ])
+        if context.distributed:
+            dist.all_reduce(minima, op=dist.ReduceOp.MIN)
+        for key, value in zip(min_keys, minima, strict=True):
+            if bool(torch.isfinite(value).detach().cpu()):
+                result[key] = value
+
+    max_keys = sorted(meter.maxima)
+    if max_keys:
+        maxima = torch.stack([
+            _reduction_tensor(meter.maxima[key], context) for key in max_keys
+        ])
+        if context.distributed:
+            dist.all_reduce(maxima, op=dist.ReduceOp.MAX)
+        for key, value in zip(max_keys, maxima, strict=True):
+            if bool(torch.isfinite(value).detach().cpu()):
+                result[key] = value
+    return result
+
+
+def reduce_max_values(
+    values: list[float],
+    context: DistributedContext,
+) -> torch.Tensor:
+    packed = torch.tensor(values, device=context.device, dtype=torch.float64)
+    if context.distributed:
+        dist.all_reduce(packed, op=dist.ReduceOp.MAX)
+    return packed
 
 
 def all_reduce_confusion_matrix(

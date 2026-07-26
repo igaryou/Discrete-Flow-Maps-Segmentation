@@ -10,6 +10,10 @@ import torch
 from torch.nn.parallel import DistributedDataParallel
 
 
+SCHEDULER_STEP_UNIT = "epoch"
+SCHEDULER_VERSION = 2
+
+
 @dataclass
 class TrainingState:
     start_epoch: int = 0
@@ -61,6 +65,8 @@ def checkpoint_payload(
         "source_model": raw_source.state_dict() if raw_source is not None else None,
         "optimizer": optimizer.state_dict() if optimizer is not None else None,
         "scheduler": scheduler.state_dict() if scheduler is not None else None,
+        "scheduler_step_unit": SCHEDULER_STEP_UNIT,
+        "scheduler_version": SCHEDULER_VERSION,
         "scaler": scaler.state_dict() if scaler is not None else None,
         "config": copy.deepcopy(config),
         "model_signature": model_signature(config),
@@ -120,6 +126,20 @@ def _resume_stage_compatible(checkpoint: dict, config: dict) -> bool:
     )
 
 
+def _validate_resume_scheduler(checkpoint: dict, path: str | Path) -> None:
+    step_unit = checkpoint.get("scheduler_step_unit")
+    version = checkpoint.get("scheduler_version")
+    if step_unit != SCHEDULER_STEP_UNIT or version != SCHEDULER_VERSION:
+        raise RuntimeError(
+            "Resume checkpoint uses an incompatible scheduler format: "
+            f"{path} has scheduler_step_unit={step_unit!r}, "
+            f"scheduler_version={version!r}; expected "
+            f"{SCHEDULER_STEP_UNIT!r}, version {SCHEDULER_VERSION}. "
+            "Legacy optimizer-step scheduler checkpoints cannot be resumed "
+            "with the epoch scheduler."
+        )
+
+
 def initialize_or_resume(
     config: dict,
     model,
@@ -169,6 +189,7 @@ def initialize_or_resume(
                 f"Resume stage mismatch: checkpoint={checkpoint.get('stage')} "
                 f"config={config['experiment']['stage']}"
             )
+        _validate_resume_scheduler(checkpoint, resume)
         model.load_state_dict(_without_module_prefix(checkpoint["model"]), strict=strict)
         if source_model is not None:
             if checkpoint.get("source_model") is None:

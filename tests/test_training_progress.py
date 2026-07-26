@@ -9,27 +9,28 @@ import torch.nn as nn
 import trainer
 from config import load_config
 from trainer import (
-    _DisplayRunningMeans,
+    _build_epoch_report,
     _create_epoch_progress,
     _epoch_total_iterations,
     _format_epoch_summary,
-    _gpu_memory_gb,
-    _progress_postfix,
 )
 
 
-CONFIG = Path(__file__).parents[1] / "configs" / "debug_diagonal_cityscapes.yaml"
+ROOT = Path(__file__).parents[1]
+CONFIG = ROOT / "configs" / "joint_ecld_cityscapes.yaml"
 
 
 class _FakeProgress:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
-        self.postfixes = []
         self.updates = 0
         self.closed = False
+        self.postfix_called = False
 
-    def set_postfix(self, postfix, *, refresh):
-        self.postfixes.append((postfix, refresh))
+    def set_postfix(self, *args, **kwargs):
+        del args, kwargs
+        self.postfix_called = True
+        raise AssertionError("The CFM-style progress bar must not use a postfix")
 
     def update(self, amount):
         self.updates += amount
@@ -52,7 +53,7 @@ class _FakeTqdm:
         self.writes.append(value)
 
 
-def test_progress_is_created_only_for_rank0_and_uses_resume_epoch(monkeypatch):
+def test_progress_is_created_only_for_rank0_and_has_no_postfix(monkeypatch):
     fake_tqdm = _FakeTqdm()
     monkeypatch.setattr(trainer, "tqdm", fake_tqdm)
 
@@ -70,6 +71,7 @@ def test_progress_is_created_only_for_rank0_and_uses_resume_epoch(monkeypatch):
         "unit": "batch",
         "mininterval": 0.5,
     }
+    assert not progress.postfix_called
 
     assert _create_epoch_progress(
         epoch_index=7,
@@ -79,110 +81,100 @@ def test_progress_is_created_only_for_rank0_and_uses_resume_epoch(monkeypatch):
     assert len(fake_tqdm.calls) == 1
 
 
-def test_epoch_total_respects_limit_and_full_loader():
+def test_epoch_total_supports_run_and_per_epoch_debug_limits():
     assert _epoch_total_iterations(743, 200, 0) == 200
     assert _epoch_total_iterations(743, 200, 150) == 50
-    assert _epoch_total_iterations(743, 200, 200) == 0
     assert _epoch_total_iterations(743, None, 150) == 743
+    assert _epoch_total_iterations(743, None, 0, 3) == 3
+    assert _epoch_total_iterations(743, 2, 2, 3) == 0
 
 
-def test_display_running_means_detach_scalars_and_ignore_nonfinite_values():
-    meter = _DisplayRunningMeans()
-    meter.update({
-        "loss_total": torch.tensor(2.0, requires_grad=True),
-        "loss_diagonal": 1.0,
-        "loss_consistency": 4.0,
-        "runtime_iteration_time": 0.5,
-    })
-    meter.update({
-        "loss_total": torch.tensor(4.0, requires_grad=True),
-        "loss_diagonal": 3.0,
-        "loss_consistency": float("nan"),
-        "runtime_iteration_time": 1.5,
-    })
-
-    assert meter.means() == {
-        "loss_total": 3.0,
-        "loss_diagonal": 2.0,
-        "loss_consistency": 4.0,
-        "runtime_iteration_time": 1.0,
-    }
-    assert all(isinstance(value, float) for value in meter.sums.values())
-
-
-@pytest.mark.parametrize("consistency_type", ["ecld", "psd", "csd", "esd"])
-def test_progress_postfix_uses_dynamic_consistency_name(consistency_type):
-    postfix = _progress_postfix(
-        {
-            "loss_total": 6.82,
-            "loss_diagonal": 2.31,
-            "loss_consistency": 11.30,
-        },
-        consistency_type=consistency_type,
-        lr=8.72e-5,
-        sec_per_batch=0.78,
-        memory_gb=21.4,
-    )
-    assert list(postfix) == [
-        "loss",
-        "diag",
-        consistency_type,
-        "lr",
-        "sec/batch",
-        "mem",
-    ]
-    assert postfix[consistency_type] == "11.3000"
-    assert postfix["mem"] == "21.4G"
-
-
-def test_cpu_memory_and_postfix_are_safe():
-    assert _gpu_memory_gb(torch.device("cpu")) is None
-    postfix = _progress_postfix(
-        {
-            "loss_total": 1.0,
-            "loss_diagonal": 2.0,
-            "loss_consistency": 3.0,
-        },
-        consistency_type="ecld",
-        lr=1.0e-4,
-        sec_per_batch=0.25,
-        memory_gb=None,
-    )
-    assert "mem" not in postfix
-
-
-def test_epoch_summary_uses_epoch_means_and_only_existing_optional_metrics():
-    summary = _format_epoch_summary(
+def test_epoch_report_has_cfm_names_and_does_not_invent_other_losses():
+    report = _build_epoch_report(
         epoch=3,
         reduced_epoch={
-            "loss_total": torch.tensor(6.734921),
-            "loss_diagonal": torch.tensor(2.281443),
-            "loss_consistency": torch.tensor(11.151237),
+            "loss_total": torch.tensor(1.760800),
+            "loss_diagonal": torch.tensor(1.294519),
+            "loss_consistency": torch.tensor(2.207328),
             "consistency_effective_weight": torch.tensor(0.5),
-            "loss_ecld_ec": torch.tensor(2.780100),
-            "loss_source_align": torch.tensor(0.034221),
-            "weighted_align": torch.tensor(0.005133),
-            "lr": torch.tensor(9.761234e-5),
-            "not_a_summary_metric": torch.tensor(123.0),
+            "loss_ecld": torch.tensor(2.207328),
+            "loss_ecld_ec": torch.tensor(2.207307),
+            "loss_ecld_td": torch.tensor(0.000021),
+            "ecld_dt_prob_norm": torch.tensor(0.004290),
+            "loss_source_var": torch.tensor(0.0),
+            "loss_source_align": torch.tensor(0.065842),
+            "weighted_var": torch.tensor(0.0),
+            "weighted_align": torch.tensor(0.009876),
+            "source_mu_abs": torch.tensor(0.290600),
+            "source_mu_min": torch.tensor(-2.475448),
+            "source_mu_max": torch.tensor(2.937300),
+            "source_logvar_mean": torch.tensor(0.0),
+            "source_sigma_mean": torch.tensor(1.0),
+            "source_x0_abs": torch.tensor(0.856801),
+            "target_x1_abs": torch.tensor(0.05),
+            "grad_norm": torch.tensor(2.710008),
         },
         consistency_type="ecld",
-        sec_per_batch=0.781234,
+        primary_weight=0.5,
+        local_batch_size=2,
+        global_batch_size=4,
+        grad_accum_steps=1,
+        optimizer_step=743,
+        processed_batches=743,
+        optimizer_updates=743,
+        elapsed_seconds=582.0,
+        rank0_peak_allocated_mb=30473.0,
+        max_peak_allocated_mb=30473.0,
+        rank0_peak_reserved_mb=30598.0,
+        max_peak_reserved_mb=30598.0,
+        epoch_lr=1.0e-5,
+        epoch_source_lr=5.0e-6,
     )
 
-    assert summary.startswith(
-        "epoch:3 loss_avg:6.734921 loss_total:6.734921 "
-        "loss_primary:2.281443 loss_consistency:11.151237 "
-        "consistency_type:ecld consistency_weight:0.500000"
+    assert list(report)[:13] == [
+        "epoch",
+        "loss_avg",
+        "loss_base",
+        "inf",
+        "distill",
+        "loss_total",
+        "loss_primary",
+        "loss_consistency",
+        "distill_type",
+        "consistency_loss_type",
+        "consistency_weight",
+        "ce_ec",
+        "td",
+    ]
+    assert report["loss_base"] == pytest.approx(
+        0.5 * report["loss_primary"]
+        + report["consistency_weight"] * report["loss_consistency"]
     )
-    assert "loss_ecld_ec:2.780100" in summary
-    assert "loss_source_align:0.034221" in summary
-    assert "weighted_align:0.005133" in summary
-    assert "lr:9.761234e-05 sec_per_batch:0.781234" in summary
-    assert "loss_psd" not in summary
-    assert "not_a_summary_metric" not in summary
+    for key in (
+        "loss_var",
+        "loss_align",
+        "weighted_var",
+        "weighted_align",
+        "mu_abs",
+        "mu_min",
+        "mu_max",
+        "logvar_mean",
+        "sigma_mean",
+        "x0_abs",
+        "x1_abs",
+    ):
+        assert key in report
+    assert "loss_psd" not in report
+    assert "loss_csd" not in report
+    assert "loss_esd" not in report
+
+    summary = _format_epoch_summary(report)
+    assert "lr:1.00000000e-05" in summary
+    assert "source_lr:5.00000000e-06" in summary
+    assert "ce_ec:2.207307 td:0.000021" in summary
 
 
-def test_training_keeps_iteration_jsonl_wandb_and_file_log_with_microbatch_bar(
+def test_training_logs_only_one_epoch_record_and_one_epoch_wandb_call(
     tmp_path, monkeypatch, capsys
 ):
     output_dir = tmp_path / "run"
@@ -192,9 +184,10 @@ def test_training_keeps_iteration_jsonl_wandb_and_file_log_with_microbatch_bar(
             f"experiment.output_dir={output_dir}",
             "runtime.device=cpu",
             "training.epochs=1",
-            "training.max_iterations=3",
+            "training.max_iterations=null",
+            "training.max_batches_per_epoch=3",
             "training.grad_accum_steps=2",
-            "training.log_interval=2",
+            "training.log_interval=1",
             "training.validation_epochs=[]",
             "wandb.enabled=false",
         ],
@@ -205,10 +198,13 @@ def test_training_keeps_iteration_jsonl_wandb_and_file_log_with_microbatch_bar(
             torch.zeros(2, 1),
             torch.zeros(2, dtype=torch.long),
         )
-        for index in range(1, 4)
+        for index in range(1, 5)
     ]
     endpoint = nn.Linear(1, 1, bias=False)
+    source = nn.Linear(1, 1, bias=False)
     fake_tqdm = _FakeTqdm()
+    saved_checkpoints = []
+    grad_norms = iter((torch.tensor(2.0), torch.tensor(4.0)))
 
     class _FakeWandb:
         def __init__(self):
@@ -225,22 +221,34 @@ def test_training_keeps_iteration_jsonl_wandb_and_file_log_with_microbatch_bar(
 
     def fake_objectives(model, *, operation, **kwargs):
         del operation, kwargs
-        parameter = next(model.parameters())
-        loss = parameter.square().mean()
-        zero = loss.detach() * 0.0
+        parameters = list(model.parameters())
+        loss = sum(parameter.square().mean() for parameter in parameters)
+        diagonal = loss.detach()
+        consistency = diagonal.new_tensor(2.0)
         return {
             "loss": loss,
             "stats": {
-                "loss_total": loss.detach(),
-                "loss_diagonal": loss.detach(),
-                "loss_consistency": zero,
-                "loss_source_var": zero,
-                "loss_source_align": zero,
-                "weighted_var": zero,
-                "weighted_align": zero,
-                "consistency_effective_weight": zero,
+                "loss_total": diagonal,
+                "loss_diagonal": diagonal,
+                "loss_consistency": consistency,
+                "consistency_effective_weight": diagonal.new_tensor(0.5),
+                "loss_source_var": diagonal.new_tensor(0.1),
+                "loss_source_align": diagonal.new_tensor(0.2),
+                "weighted_var": diagonal.new_tensor(0.01),
+                "weighted_align": diagonal.new_tensor(0.02),
+                "source_mu_abs": diagonal.new_tensor(0.3),
+                "source_mu_min": diagonal.new_tensor(-1.0),
+                "source_mu_max": diagonal.new_tensor(1.0),
+                "source_logvar_mean": diagonal.new_tensor(0.0),
+                "source_sigma_mean": diagonal.new_tensor(1.0),
+                "source_x0_abs": diagonal.new_tensor(0.8),
+                "target_x1_abs": diagonal.new_tensor(0.05),
+                "loss_ecld": consistency,
+                "loss_ecld_ec": diagonal.new_tensor(1.9),
+                "loss_ecld_td": diagonal.new_tensor(0.1),
+                "ecld_dt_prob_norm": diagonal.new_tensor(0.01),
             },
-            "consistency_type": "none",
+            "consistency_type": "ecld",
         }
 
     monkeypatch.setattr(
@@ -251,7 +259,7 @@ def test_training_keeps_iteration_jsonl_wandb_and_file_log_with_microbatch_bar(
     monkeypatch.setattr(
         trainer,
         "build_models",
-        lambda config, device: (endpoint.to(device), None),
+        lambda config, device: (endpoint.to(device), source.to(device)),
     )
     monkeypatch.setattr(
         trainer,
@@ -270,40 +278,62 @@ def test_training_keeps_iteration_jsonl_wandb_and_file_log_with_microbatch_bar(
     monkeypatch.setattr(
         trainer,
         "_save_training_checkpoint",
-        lambda **kwargs: None,
+        lambda **kwargs: saved_checkpoints.append(kwargs),
     )
     monkeypatch.setattr(trainer, "init_wandb", lambda config: fake_wandb)
     monkeypatch.setattr(trainer, "tqdm", fake_tqdm)
+    monkeypatch.setattr(
+        torch.nn.utils,
+        "clip_grad_norm_",
+        lambda *args, **kwargs: next(grad_norms),
+    )
 
-    trainer.run_training(config)
+    trainer.run_training(config, joint_entrypoint=True)
 
     assert len(fake_tqdm.calls) == 1
     progress = fake_tqdm.calls[0]
     assert progress.kwargs["total"] == 3
     assert progress.updates == 3
     assert progress.closed
-    assert len(progress.postfixes) == 3
-    assert all(refresh is False for _, refresh in progress.postfixes)
-    assert "none" in progress.postfixes[-1][0]
+    assert not progress.postfix_called
+    assert len(fake_tqdm.writes) == 1
 
     records = [
         json.loads(line)
         for line in (output_dir / "metrics.jsonl").read_text().splitlines()
     ]
-    assert [record["scope"] for record in records] == [
-        "iteration",
-        "iteration",
-        "epoch",
-        "runtime",
-    ]
-    assert [record["iteration"] for record in records[:2]] == [1, 2]
+    assert [record["scope"] for record in records] == ["epoch", "runtime"]
+    epoch_record = records[0]
+    assert epoch_record["grad_norm"] == pytest.approx(3.0)
+    assert epoch_record["loss_align"] == pytest.approx(0.2)
+    assert epoch_record["weighted_align"] == pytest.approx(0.02)
+    assert epoch_record["sigma_mean"] == pytest.approx(1.0)
 
-    assert len(fake_wandb.logs) == 4
-    assert [step for _, step in fake_wandb.logs[:2]] == [0, 1]
+    assert len(fake_wandb.logs) == 1
+    epoch_payload, epoch_step = fake_wandb.logs[0]
+    assert epoch_step == 2
+    assert all(key.startswith("epoch/") for key in epoch_payload)
+    assert epoch_payload["epoch/grad_norm"] == pytest.approx(3.0)
     assert fake_wandb.finished
+
+    base_model_lr = config["training"]["optimizer"]["parameter_groups"]["model"]["lr"]
+    base_model_lr = base_model_lr or config["training"]["optimizer"]["lr"]
+    base_source_lr = (
+        config["training"]["optimizer"]["parameter_groups"]["source"]["lr"]
+        or config["training"]["optimizer"]["lr"]
+    )
+    expected_factor = config["training"]["scheduler"]["warmup_start_factor"]
+    assert epoch_record["lr"] == pytest.approx(base_model_lr * expected_factor)
+    assert epoch_record["source_lr"] == pytest.approx(
+        base_source_lr * expected_factor
+    )
+
+    assert len(saved_checkpoints) == 1
+    saved_scheduler = saved_checkpoints[0]["scheduler"]
+    assert saved_scheduler.last_epoch == 1
 
     console = capsys.readouterr().err
     assert "epoch=1 iter=" not in console
     file_log = (output_dir / "train_log.txt").read_text()
-    assert "epoch=1 iter=1 step=0" in file_log
-    assert "epoch=1 iter=2 step=1" in file_log
+    assert "epoch=1 iter=" not in file_log
+    assert file_log.count("| epoch:1 ") == 1

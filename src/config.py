@@ -103,6 +103,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "training": {
         "epochs": 150,
         "max_iterations": None,
+        "max_batches_per_epoch": None,
         "batch_size": 4,
         "grad_accum_steps": 1,
         "optimizer": {
@@ -118,7 +119,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "scheduler": {
             "name": "cosine",
             "warmup_epochs": 20,
+            "warmup_start_factor": 0.1,
             "eta_min": 1.0e-6,
+            "step_unit": "epoch",
         },
         "grad_clip": 1.0,
         "label_smoothing": 0.1,
@@ -284,6 +287,19 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("dataset.crop_size must be null or [height, width]")
     if config["runtime"]["amp_dtype"] not in {"bf16", "fp16"}:
         raise ValueError("runtime.amp_dtype must be bf16 or fp16")
+    training = config["training"]
+    if (
+        training["max_batches_per_epoch"] is not None
+        and training["max_batches_per_epoch"] <= 0
+    ):
+        raise ValueError("training.max_batches_per_epoch must be null or positive")
+    scheduler = training["scheduler"]
+    if scheduler["step_unit"] != "epoch":
+        raise ValueError("training.scheduler.step_unit must be epoch")
+    if not (0.0 < scheduler["warmup_start_factor"] <= 1.0):
+        raise ValueError(
+            "training.scheduler.warmup_start_factor must satisfy 0 < factor <= 1"
+        )
     distributed = config["distributed"]
     if distributed["enabled"] not in {"auto", True, False}:
         raise ValueError("distributed.enabled must be auto, true, or false")

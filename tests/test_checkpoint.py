@@ -4,7 +4,13 @@ import pytest
 import torch
 import yaml
 
-from checkpoint import checkpoint_payload, initialize_or_resume, save_checkpoint
+from checkpoint import (
+    SCHEDULER_STEP_UNIT,
+    SCHEDULER_VERSION,
+    checkpoint_payload,
+    initialize_or_resume,
+    save_checkpoint,
+)
 from config import load_config
 
 
@@ -40,6 +46,8 @@ def test_stage1_payload_contains_required_stage_information(tmp_path):
     assert payload["stage"] == "diagonal_pretrain"
     assert payload["source_model"] is None
     assert payload["epoch"] == 2 and payload["global_step"] == 7
+    assert payload["scheduler_step_unit"] == SCHEDULER_STEP_UNIT
+    assert payload["scheduler_version"] == SCHEDULER_VERSION
 
 
 def test_init_from_loads_weights_but_not_optimizer_or_epoch(tmp_path):
@@ -143,4 +151,37 @@ def test_joint_resume_is_complete_and_rejects_other_stages(tmp_path):
         initialize_or_resume(
             joint, restored_model, None, restored_optimizer, restored_scheduler,
             restored_scaler,
+        )
+
+
+def test_legacy_step_scheduler_checkpoint_is_rejected_on_resume(tmp_path):
+    joint = load_config(ROOT / "configs" / "joint_ecld_cityscapes.yaml")
+    model, optimizer, scheduler, scaler = objects()
+    payload = checkpoint_payload(
+        config=joint,
+        epoch=2,
+        global_step=100,
+        model=model,
+        source_model=None,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        metrics={},
+    )
+    payload.pop("scheduler_step_unit")
+    payload.pop("scheduler_version")
+    path = save_checkpoint(payload, tmp_path, "legacy.pt")
+    joint["checkpoint"]["resume"] = str(path)
+
+    with pytest.raises(
+        RuntimeError,
+        match="Legacy optimizer-step scheduler checkpoints cannot be resumed",
+    ):
+        initialize_or_resume(
+            joint,
+            model,
+            None,
+            optimizer,
+            scheduler,
+            scaler,
         )

@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from discrete_flow_maps import flow_map, sample_sorted_times
+from discrete_flow_maps import flow_map, sample_prior, sample_sorted_times
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -32,3 +32,47 @@ def test_sorted_time_sampling_enforces_gap_and_keeps_endpoint_one_available():
     assert (s >= 0).all() and (t <= 1).all()
     assert ((t - s) >= 0.9999e-5).all()
 
+
+def test_image_gaussian_prior_reports_actual_detached_cfm_statistics():
+    class Source:
+        fixed_std = 1.0
+
+        def __call__(self, image):
+            mu = torch.linspace(
+                -2.0, 2.0, image.shape[0] * 4 * 2 * 3
+            ).reshape(image.shape[0], 4, 2, 3)
+            logvar = torch.zeros_like(mu)
+            x0 = mu + 0.25
+            return x0, mu, logvar
+
+    image = torch.randn(2, 3, 2, 3)
+    target = torch.nn.functional.one_hot(
+        torch.randint(0, 4, (2, 2, 3)), 4
+    ).permute(0, 3, 1, 2).float()
+    config = {
+        "dataset": {"num_classes": 4},
+        "source": {
+            "prior_type": "image_gaussian",
+            "var_weight": 0.0,
+            "align_weight": 0.15,
+            "use_loss_align": True,
+            "align_eps": 1.0e-8,
+        },
+    }
+    x0, stats = sample_prior(config, image, target, Source())
+    mu = x0 - 0.25
+
+    assert float(stats["source_mu_abs"]) == pytest.approx(
+        float(mu.abs().mean())
+    )
+    assert float(stats["source_mu_min"]) == pytest.approx(-2.0)
+    assert float(stats["source_mu_max"]) == pytest.approx(2.0)
+    assert float(stats["source_logvar_mean"]) == 0.0
+    assert float(stats["source_sigma_mean"]) == 1.0
+    assert float(stats["source_x0_abs"]) == pytest.approx(
+        float(x0.abs().mean())
+    )
+    assert float(stats["target_x1_abs"]) == pytest.approx(
+        float(target.abs().mean())
+    )
+    assert all(not value.requires_grad for value in stats.values())
