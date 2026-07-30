@@ -312,6 +312,8 @@ Stage 1/2 checkpointをjoint resumeへ渡すとstage mismatch errorになりま�
 YAMLは`extends: base.yaml`で同じディレクトリの設定を継承でき、派生設定は
 上書き部分だけを保持します。load後の完全な設定は各runの
 `config_resolved.yaml`へ保存されるため、実行条件は常に再現できます。
+本学習用のStage 2およびjoint configは、各実験条件を単独で確認できるよう、
+他configを継承しない自己完結型YAMLとして定義しています。
 
 validation/evaluationはpaddingしない`DistributedEvalSampler`を使うため、全画像を
 ちょうど1回だけ評価します。各rankの20×20 confusion matrixをSUM all-reduce

@@ -14,6 +14,45 @@ EXPECTED_ESD_METADATA = {
     "source": "discrete_flow_maps",
     "additional_numerical_safeguards": True,
 }
+FULL_TRAINING_CONFIGS = tuple(
+    Path(__file__).parents[1] / "configs" / f"{stage}_{loss}_cityscapes.yaml"
+    for stage in ("stage2", "joint")
+    for loss in ("psd", "csd", "ecld", "esd")
+)
+FULL_TRAINING_SECTIONS = {
+    "experiment",
+    "runtime",
+    "distributed",
+    "dataset",
+    "augmentation",
+    "model",
+    "source",
+    "flow",
+    "time_sampling",
+    "training",
+    "loss",
+    "checkpoint",
+    "evaluation",
+    "wandb",
+}
+
+
+@pytest.mark.parametrize("path", FULL_TRAINING_CONFIGS, ids=lambda path: path.stem)
+def test_stage2_and_joint_training_configs_are_self_contained(path):
+    raw = yaml.safe_load(path.read_text())
+    assert "extends" not in raw
+    assert FULL_TRAINING_SECTIONS <= raw.keys()
+
+    config = load_config(path)
+    stage, loss_type, _dataset = path.stem.split("_", 2)
+    assert config["loss"]["consistency"]["type"] == loss_type
+    if stage == "stage2":
+        assert config["experiment"]["stage"] == "consistency_distillation"
+        assert config["checkpoint"]["init_from"] is not None
+    else:
+        assert config["experiment"]["stage"] == "joint_training"
+        assert config["checkpoint"]["init_from"] is None
+        assert config["checkpoint"]["resume"] is None
 
 
 def test_yaml_load_and_cli_override():
