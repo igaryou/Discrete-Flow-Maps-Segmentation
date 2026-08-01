@@ -8,11 +8,13 @@ import torch.nn as nn
 
 import trainer
 from config import load_config
+from losses import esd_schedule_weight
 from trainer import (
     _build_epoch_report,
     _create_epoch_progress,
     _epoch_total_iterations,
     _format_epoch_summary,
+    _numbered_checkpoint_epochs,
 )
 
 
@@ -87,6 +89,52 @@ def test_epoch_total_supports_run_and_per_epoch_debug_limits():
     assert _epoch_total_iterations(743, None, 150) == 743
     assert _epoch_total_iterations(743, None, 0, 3) == 3
     assert _epoch_total_iterations(743, 2, 2, 3) == 0
+
+
+def test_joint_numbered_checkpoints_include_last_pure_stage1_epoch():
+    # start_epoch is compared with the internal 0-indexed epoch. Consequently,
+    # start_epoch=500 first contributes at displayed epoch 501.
+    assert esd_schedule_weight(499, 0.5, 500, 0) == 0.0
+    assert esd_schedule_weight(500, 0.0, 500, 0) == 1.0
+    assert _numbered_checkpoint_epochs(
+        total_epochs=800,
+        checkpoint_interval=200,
+        joint_entrypoint=True,
+        consistency_enabled=True,
+        consistency_start_epoch=500,
+    ) == {200, 400, 500, 600, 800}
+
+
+@pytest.mark.parametrize(
+    ("interval", "start_epoch", "joint", "enabled", "expected"),
+    [
+        (100, 501, True, True, {100, 200, 300, 400, 500, 501, 600, 700, 800}),
+        (200, 0, True, True, {200, 400, 600, 800}),
+        (200, 900, True, True, {200, 400, 600, 800}),
+        (200, 500, False, True, {200, 400, 600, 800}),
+        (200, 500, True, False, {200, 400, 600, 800}),
+    ],
+)
+def test_numbered_checkpoint_epoch_edge_cases(
+    interval, start_epoch, joint, enabled, expected
+):
+    assert _numbered_checkpoint_epochs(
+        total_epochs=800,
+        checkpoint_interval=interval,
+        joint_entrypoint=joint,
+        consistency_enabled=enabled,
+        consistency_start_epoch=start_epoch,
+    ) == expected
+
+
+def test_numbered_checkpoint_epochs_deduplicate_and_preserve_final_handling():
+    assert _numbered_checkpoint_epochs(
+        total_epochs=750,
+        checkpoint_interval=100,
+        joint_entrypoint=True,
+        consistency_enabled=True,
+        consistency_start_epoch=500,
+    ) == {100, 200, 300, 400, 500, 600, 700}
 
 
 def test_epoch_report_has_cfm_names_and_does_not_invent_other_losses():
@@ -329,6 +377,7 @@ def test_training_logs_only_one_epoch_record_and_one_epoch_wandb_call(
     )
 
     assert len(saved_checkpoints) == 1
+    assert saved_checkpoints[0]["filenames"] == ["latest.pt"]
     saved_scheduler = saved_checkpoints[0]["scheduler"]
     assert saved_scheduler.last_epoch == 1
 

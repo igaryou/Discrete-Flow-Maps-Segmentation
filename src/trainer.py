@@ -123,6 +123,35 @@ def _epoch_total_iterations(
     return total
 
 
+def _numbered_checkpoint_epochs(
+    *,
+    total_epochs: int,
+    checkpoint_interval: int,
+    joint_entrypoint: bool,
+    consistency_enabled: bool,
+    consistency_start_epoch: int,
+) -> set[int]:
+    """Return 1-indexed epochs that receive an ``epoch_NNNN.pt`` file."""
+    epochs = (
+        set(range(checkpoint_interval, total_epochs + 1, checkpoint_interval))
+        if checkpoint_interval > 0
+        else set()
+    )
+
+    # The training loop passes its 0-indexed epoch_index directly to the
+    # consistency schedule. Therefore start_epoch=N first contributes during
+    # displayed epoch N+1, and displayed epoch N is the last pure Stage 1 epoch.
+    first_consistency_epoch = consistency_start_epoch + 1
+    stage1_end_epoch = first_consistency_epoch - 1
+    if (
+        joint_entrypoint
+        and consistency_enabled
+        and 1 <= stage1_end_epoch < total_epochs
+    ):
+        epochs.add(stage1_end_epoch)
+    return epochs
+
+
 def _create_epoch_progress(
     *,
     epoch_index: int,
@@ -709,6 +738,14 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
             wandb_run = init_wandb(config)
 
         training = config["training"]
+        consistency_config = config["loss"]["consistency"]
+        numbered_checkpoint_epochs = _numbered_checkpoint_epochs(
+            total_epochs=training["epochs"],
+            checkpoint_interval=training["checkpoint_interval_epochs"],
+            joint_entrypoint=joint_entrypoint,
+            consistency_enabled=consistency_config["enabled"],
+            consistency_start_epoch=consistency_config["start_epoch"],
+        )
         operation = _operation_for_stage(stage)
         metrics_path = output_dir / "metrics.jsonl"
         total_iterations = 0
@@ -914,7 +951,8 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                 "best_mIoU": state.best_miou,
             }
             filenames = ["latest.pt"]
-            if (epoch_index + 1) % training["checkpoint_interval_epochs"] == 0:
+            displayed_epoch = epoch_index + 1
+            if displayed_epoch in numbered_checkpoint_epochs:
                 filenames.append(f"epoch_{epoch_index + 1:04d}.pt")
             if (
                 validation_metrics is not None

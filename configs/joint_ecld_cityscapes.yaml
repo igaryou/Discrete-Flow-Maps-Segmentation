@@ -1,7 +1,7 @@
 experiment:
   name: dfm_joint_ecld_cityscapes
   seed: 42
-  output_dir: /home/igarashi_25/playground_2/CSDFM/DFM/results/joint_ecld
+  output_dir: /home/igarashi_25/playground_2/CSDFM/DFM/results/ecld
   stage: joint_training
 runtime:
   device: auto
@@ -88,8 +88,8 @@ training:
     weight_decay: 1.0e-3
     betas: [0.9, 0.999]
     parameter_groups:
-      model: {lr: 5.0e-5}
-      source: {lr: 1.0e-5}
+      model: {lr: 1.0e-4}
+      source: {lr: 1.0e-4}
   scheduler:
     name: cosine
     warmup_epochs: 10
@@ -100,13 +100,13 @@ training:
   checkpoint_interval_epochs: 200
   validation_epochs: [75, 150, 200, 300, 500, 600, 800]
 loss:
-  primary: {type: diagonal_ce, weight: 0.5}
+  primary: {type: diagonal_ce, weight: 0.75}
   consistency:
-    enabled: true
+    enabled: truehtop
     type: ecld
-    weight: 0.5
+    weight: 0.25
     start_epoch: 0
-    warmup_epochs: 30
+    warmup_epochs: 0
     schedule: linear
     max_weight: 1.0
     precision: {jvp_dtype: bf16, numerical_dtype: fp32, debug_assertions: false}
@@ -139,10 +139,10 @@ checkpoint:
 evaluation:
   split: val
   batch_size: 4
-  num_steps: 3
+  num_steps: 1
   sampler: flow_map
   save_predictions: true
-  max_visualizations: 16
+  max_visualizations: 32
   max_batches: null
   checkpoint: null
 wandb:

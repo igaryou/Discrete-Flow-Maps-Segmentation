@@ -1,7 +1,7 @@
 experiment:
   name: dfm_joint_esd_cityscapes
   seed: 42
-  output_dir: /home/igarashi_25/playground_2/CSDFM/DFM/results/joint_esd
+  output_dir: /home/igarashi_25/playground_2/CSDFM/DFM/results/esd
   stage: joint_training
 runtime:
   device: auto
@@ -97,7 +97,7 @@ training:
   grad_clip: 1.0
   label_smoothing: 0.0
   log_interval: 50
-  checkpoint_interval_epochs: 200
+  checkpoint_interval_epochs: 100
   validation_epochs: [75, 150, 200, 300, 500, 600, 800]
 loss:
   primary: {type: diagonal_ce, weight: 0.5}
@@ -106,7 +106,7 @@ loss:
     type: esd
     weight: 0.5
     start_epoch: 0
-    warmup_epochs: 30
+    warmup_epochs: 0
     schedule: linear
     max_weight: 1.0
     precision: {jvp_dtype: bf16, numerical_dtype: fp32, debug_assertions: false}
