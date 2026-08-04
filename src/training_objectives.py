@@ -91,7 +91,7 @@ def compute_model_training_objectives(
         diagonal_logits, target, training["label_smoothing"]
     ).float()
 
-    if operation != "stage1_objectives":
+    if operation != "stage1_objectives" and effective_weight > 0.0 :
         consistency_image_feat = image_feat
         if (
             consistency_config["precision"].get("jvp_dtype") == "fp32"
@@ -113,6 +113,7 @@ def compute_model_training_objectives(
         )
         consistency_loss = consistency_result.loss
     else:
+        consistency_result = None
         consistency_loss = zero
 
     total = (

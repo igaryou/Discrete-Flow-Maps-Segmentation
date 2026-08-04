@@ -136,7 +136,7 @@ checkpoint:
 evaluation:
   split: val
   batch_size: 4
-  num_steps: 3
+  num_steps: 1
   sampler: flow_map
   save_predictions: true
   max_visualizations: 16

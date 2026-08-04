@@ -89,19 +89,85 @@ def save_checkpoint(payload: dict, output_dir: str | Path, filename: str) -> Pat
     return destination
 
 
-def _validate_stage1_checkpoint(checkpoint: dict, config: dict, path: str | Path) -> None:
-    if checkpoint.get("stage") != "diagonal_pretrain":
+def _validate_joint_stage1_boundary(
+    checkpoint: dict, path: str | Path
+) -> None:
+    saved_config = checkpoint.get("config")
+    try:
+        consistency = saved_config["loss"]["consistency"]
+        consistency_enabled = consistency["enabled"]
+        saved_start_epoch = consistency["start_epoch"]
+    except (KeyError, TypeError) as exc:
         raise RuntimeError(
-            f"Stage 2 init_from requires a diagonal_pretrain checkpoint: {path}"
+            "Joint Stage 2 initialization checkpoint is missing "
+            f"config.loss.consistency metadata: {path}"
+        ) from exc
+
+    saved_epoch = checkpoint.get("epoch")
+    if (
+        isinstance(saved_epoch, bool)
+        or not isinstance(saved_epoch, int)
+        or isinstance(saved_start_epoch, bool)
+        or not isinstance(saved_start_epoch, int)
+    ):
+        raise RuntimeError(
+            "Joint Stage 2 initialization checkpoint must contain integer epoch "
+            f"and consistency.start_epoch values: {path}"
         )
+    if consistency_enabled is not True:
+        raise RuntimeError(
+            "Joint Stage 2 initialization checkpoint must have consistency loss "
+            f"enabled in its saved config: {path}"
+        )
+
+    # The checkpoint epoch is the 1-indexed number of completed epochs, while
+    # the schedule receives the loop's 0-indexed epoch. Thus start_epoch=N first
+    # permits a consistency update in displayed epoch N+1; epoch N is safe.
+    if saved_epoch > saved_start_epoch:
+        raise RuntimeError(
+            "Joint checkpoint may already contain consistency-loss updates and "
+            "cannot initialize Stage 2: "
+            f"completed epoch={saved_epoch}, last safe epoch={saved_start_epoch}, "
+            f"path={path}"
+        )
+
+
+def _validate_stage2_init_checkpoint(
+    checkpoint: dict, config: dict, path: str | Path
+) -> None:
+    saved_stage = checkpoint.get("stage")
+    if saved_stage == "joint_training":
+        _validate_joint_stage1_boundary(checkpoint, path)
+    elif saved_stage != "diagonal_pretrain":
+        raise RuntimeError(
+            "Stage 2 init_from requires a diagonal_pretrain checkpoint or a "
+            "joint_training checkpoint saved no later than its Stage 1 boundary: "
+            f"stage={saved_stage!r}, path={path}"
+        )
+
+    if checkpoint.get("model") is None:
+        raise RuntimeError(
+            f"Stage 2 initialization checkpoint has no model state: {path}"
+        )
+    if "source_model" not in checkpoint:
+        raise RuntimeError(
+            f"Stage 2 initialization checkpoint has no source_model state: {path}"
+        )
+
     saved_signature = checkpoint.get("model_signature")
     current_signature = model_signature(config)
     if saved_signature is None:
         saved_config = checkpoint.get("config", {})
-        saved_signature = model_signature(saved_config)
+        try:
+            saved_signature = model_signature(saved_config)
+        except (KeyError, TypeError) as exc:
+            raise RuntimeError(
+                f"Stage 2 initialization checkpoint has no usable model signature: {path}"
+            ) from exc
     if saved_signature != current_signature:
         raise RuntimeError(
-            "Stage 1 checkpoint is incompatible with Stage 2 model/source configuration.\n"
+            "Stage 2 initialization checkpoint is incompatible with the current "
+            "model/source configuration.\n"
             f"saved={saved_signature}\ncurrent={current_signature}"
         )
 
@@ -157,31 +223,42 @@ def initialize_or_resume(
     strict = checkpoint_config["strict_model"]
     if init_from:
         checkpoint = torch.load(init_from, map_location="cpu", weights_only=False)
-        _validate_stage1_checkpoint(checkpoint, config, init_from)
-        model.load_state_dict(_without_module_prefix(checkpoint["model"]), strict=strict)
+        _validate_stage2_init_checkpoint(checkpoint, config, init_from)
         saved_source = checkpoint.get("source_model")
         if source_model is not None:
             if saved_source is None:
-                raise RuntimeError("Stage 1 checkpoint has no source_model state")
+                raise RuntimeError(
+                    "Stage 2 initialization checkpoint has no source_model state: "
+                    f"{init_from}"
+                )
+        model.load_state_dict(
+            _without_module_prefix(checkpoint["model"]), strict=strict
+        )
+        if source_model is not None:
             source_model.load_state_dict(
                 _without_module_prefix(saved_source), strict=strict
             )
-        metrics = checkpoint.get("metrics", {})
-        best = metrics.get("best_mIoU", metrics.get("mIoU", float("-inf")))
         lines = (
-            f"Loaded Stage 1 checkpoint: {init_from}",
-            f"Stage 1 completed epoch: {checkpoint.get('epoch', 'unknown')}",
-            f"Stage 1 best mIoU: {best}",
-            "Starting Stage 2 from epoch 1",
+            f"Loaded Stage 2 initialization checkpoint: {init_from}",
+            f"Checkpoint original stage: {checkpoint.get('stage')}",
+            f"Checkpoint completed epoch: {checkpoint.get('epoch', 'unknown')}",
+            "Loaded states: model, source_model",
             "Optimizer state: newly initialized",
             "Scheduler state: newly initialized",
+            "Scaler state: newly initialized",
+            "Stage 2 start epoch: 1",
+            "Global step reset to: 0",
+            "Best mIoU reset to: -inf",
             f"Consistency loss: {config['loss']['consistency']['type']}",
-            f"ESD enabled: {str(config['loss']['consistency']['type'] == 'esd').lower()}",
         )
         if logger is not None:
             for line in lines:
                 logger.info(line)
-        return TrainingState()
+        return TrainingState(
+            start_epoch=0,
+            global_step=0,
+            best_miou=float("-inf"),
+        )
     if resume:
         checkpoint = torch.load(resume, map_location="cpu", weights_only=False)
         if not _resume_stage_compatible(checkpoint, config):

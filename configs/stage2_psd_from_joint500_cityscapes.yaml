@@ -1,8 +1,8 @@
 experiment:
-  name: dfm_joint_esd_cityscapes
+  name: dfm_cityscapes_stage2_psd_from_joint500
   seed: 42
-  output_dir: /home/igarashi_25/playground_2/CSDFM/DFM/results/esd
-  stage: joint_training
+  output_dir: /home/igarashi_25/playground_2/CSDFM/DFM/results/stage2_psd_from_joint500
+  stage: consistency_distillation
 runtime:
   device: auto
   amp: true
@@ -78,38 +78,43 @@ time_sampling:
   max_time: 1.0
   min_gap: 1.0e-5
 training:
-  epochs: 800
+  epochs: 300
   max_iterations: null
   batch_size: 4
   grad_accum_steps: 1
   optimizer:
     name: adamw
-    lr: 1.0e-4
+    lr: 3.2e-5
     weight_decay: 1.0e-3
     betas: [0.9, 0.999]
     parameter_groups:
-      model: {lr: 1.0e-4}
-      source: {lr: 5.0e-5}
+      model: {lr: 3.2e-5}
+      source: {lr: 1.6e-5}
   scheduler:
     name: cosine
-    warmup_epochs: 10
+    warmup_epochs: 0
     eta_min: 5.0e-7
   grad_clip: 1.0
   label_smoothing: 0.0
   log_interval: 50
-  checkpoint_interval_epochs: 200
-  validation_epochs: [75, 150, 200, 300, 500, 600, 800]
+  checkpoint_interval_epochs: 100
+  validation_epochs: [75, 150, 200, 300]
 loss:
-  primary: {type: diagonal_ce, weight: 1.0}
+  primary:
+    type: diagonal_ce
+    weight: 1.0
   consistency:
     enabled: true
-    type: esd
+    type: psd
     weight: 0.5
-    start_epoch: 500
-    warmup_epochs: 50
+    start_epoch: 0
+    warmup_epochs: 30
     schedule: linear
     max_weight: 1.0
-    precision: {jvp_dtype: bf16, numerical_dtype: fp32, debug_assertions: false}
+    precision:
+      jvp_dtype: null
+      numerical_dtype: fp32
+      debug_assertions: false
     psd: {}
     csd: {}
     ecld: {ec_weight: 4.0, td_weight: 2.0, time_weighting: none}
@@ -128,7 +133,7 @@ loss:
       log_eps: 1.0e-6
       skip_batch_threshold: 0.5
 checkpoint:
-  init_from: null
+  init_from: /home/igarashi_25/playground_2/CSDFM/DFM/results/esd/epoch_0500.pt
   resume: null
   load_optimizer: false
   load_scheduler: false
@@ -136,7 +141,7 @@ checkpoint:
 evaluation:
   split: val
   batch_size: 4
-  num_steps: 1
+  num_steps: 3
   sampler: flow_map
   save_predictions: true
   max_visualizations: 16
@@ -145,7 +150,7 @@ evaluation:
 wandb:
   enabled: true
   project: DFM
-  name: dfm-joint-esd-256x512
+  name: dfm-stage2-psd-from-joint500-256x512
   entity: null
   mode: online
-  tags: [cityscapes, joint, esd]
+  tags: [cityscapes, stage2, psd, joint500-init]

@@ -9,6 +9,11 @@ from trainer import log_esd_experiment_metadata
 
 CONFIG = Path(__file__).parents[1] / "configs" / "debug_diagonal_cityscapes.yaml"
 ESD_CONFIG = Path(__file__).parents[1] / "configs" / "debug_esd_cityscapes.yaml"
+PSD_FROM_JOINT_CONFIG = (
+    Path(__file__).parents[1]
+    / "configs"
+    / "stage2_psd_from_joint500_cityscapes.yaml"
+)
 EXPECTED_ESD_METADATA = {
     "formulation": "stabilized_logit_space",
     "source": "discrete_flow_maps",
@@ -53,6 +58,23 @@ def test_stage2_and_joint_training_configs_are_self_contained(path):
         assert config["experiment"]["stage"] == "joint_training"
         assert config["checkpoint"]["init_from"] is None
         assert config["checkpoint"]["resume"] is None
+
+
+def test_stage2_psd_from_joint500_config_keeps_warmups_separate():
+    config = load_config(PSD_FROM_JOINT_CONFIG)
+    assert config["experiment"]["stage"] == "consistency_distillation"
+    assert config["training"]["epochs"] == 300
+    assert config["training"]["optimizer"]["parameter_groups"] == {
+        "model": {"lr": 3.2e-5},
+        "source": {"lr": 1.6e-5},
+    }
+    assert config["training"]["scheduler"]["warmup_epochs"] == 0
+    assert config["loss"]["consistency"]["type"] == "psd"
+    assert config["loss"]["consistency"]["start_epoch"] == 0
+    assert config["loss"]["consistency"]["warmup_epochs"] == 30
+    assert config["checkpoint"]["init_from"].endswith(
+        "/results/esd/epoch_0500.pt"
+    )
 
 
 def test_yaml_load_and_cli_override():

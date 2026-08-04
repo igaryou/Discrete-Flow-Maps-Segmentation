@@ -15,3 +15,29 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 CUDA_VISIBLE_DEVICES=3 \
 uv run python src/train.py \
   --config /home/igarashi_25/playground_2/CSDFM/DFM/configs/stage1_diagonal_cityscapes.yaml
+
+
+cd /home/igarashi_25/playground_2/CSDFM/DFM
+
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+CUDA_VISIBLE_DEVICES=2,3 \
+uv run torchrun \
+  --standalone \
+  --nproc_per_node=2 \
+  src/train_joint.py \
+  --config configs/joint_esd_cityscapes.yaml
+
+
+cd /home/igarashi_25/playground_2/CSDFM/DFM
+
+
+cd /home/igarashi_25/playground_2/CSDFM/DFM
+
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+CUDA_VISIBLE_DEVICES=3 \
+uv run python src/evaluate.py \
+  --config configs/joint_esd_cityscapes.yaml \
+  --checkpoint /home/igarashi_25/playground_2/CSDFM/DFM/results/esd/latest.pt \
+  --set evaluation.num_steps=5 \
+  --set source.fixed_std=1.0
+
