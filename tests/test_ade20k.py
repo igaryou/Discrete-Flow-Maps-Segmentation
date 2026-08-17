@@ -82,6 +82,7 @@ def test_ade20k_main_config_is_151_state_and_prevents_double_normalization():
     assert config["loss"]["ignore_index"] == 0
     assert config["source"]["input_already_normalized"] is True
     assert config["training"]["max_optimizer_steps"] == 160000
+    assert config["training"]["validation_epochs"] == []
     assert config["training"]["scheduler"]["step_unit"] == "optimizer_step"
     assert config["evaluation"]["interval"] == {
         "unit": "optimizer_step", "value": 16000
@@ -264,17 +265,36 @@ def test_terminal_state_is_bilinear_resized_before_argmax_and_after_unpadding():
     assert not bool((prediction == 2).any())
 
 
-@pytest.mark.parametrize("validation_epochs", [[], [1]])
+@pytest.mark.parametrize(
+    (
+        "validation_epochs", "start_step", "max_steps", "interval_steps",
+        "validation_mious", "expected_best_steps",
+    ),
+    [
+        ([1], 0, 10, 16000, [0.5], [10]),
+        ([], 0, 20, 10, [0.5, 0.4], [10]),
+        ([], 0, 20, 10, [0.5, 0.6], [10, 20]),
+        ([], 159999, 160000, 16000, [0.7], [160000]),
+    ],
+)
 def test_optimizer_step_budget_counts_accumulation_scheduler_and_final_validation(
-    tmp_path, monkeypatch, validation_epochs
+    tmp_path,
+    monkeypatch,
+    validation_epochs,
+    start_step,
+    max_steps,
+    interval_steps,
+    validation_mious,
+    expected_best_steps,
 ):
     config = _config()
     config["experiment"]["output_dir"] = str(tmp_path / "run")
     config["runtime"].update({"device": "cpu", "amp": False})
     config["training"].update({
-        "epochs": 1, "max_optimizer_steps": 10, "grad_accum_steps": 4,
+        "epochs": 1, "max_optimizer_steps": max_steps, "grad_accum_steps": 4,
         "validation_epochs": validation_epochs, "checkpoint_interval_epochs": 0,
     })
+    config["evaluation"]["interval"]["value"] = interval_steps
     config["wandb"]["enabled"] = False
     batches = [
         (torch.zeros(1, 1), torch.zeros(1, 1), torch.zeros(1, dtype=torch.long))
@@ -319,6 +339,7 @@ def test_optimizer_step_budget_counts_accumulation_scheduler_and_final_validatio
 
     saved = []
     validation_calls = []
+    validation_results = iter(validation_mious)
     monkeypatch.setattr(trainer, "_build_loaders", lambda *args: (batches, [], None))
     monkeypatch.setattr(trainer, "build_models", lambda *args: (endpoint, source))
     monkeypatch.setattr(trainer, "build_optimizer", counting_optimizer)
@@ -326,22 +347,51 @@ def test_optimizer_step_budget_counts_accumulation_scheduler_and_final_validatio
     monkeypatch.setattr(trainer, "run_model_training_objectives", objectives)
     monkeypatch.setattr(
         trainer, "initialize_or_resume",
-        lambda *args, **kwargs: SimpleNamespace(start_epoch=0, global_step=0, micro_step=0, best_miou=float("-inf")),
+        lambda *args, **kwargs: SimpleNamespace(
+            start_epoch=0,
+            global_step=start_step,
+            micro_step=0,
+            best_miou=float("-inf"),
+        ),
     )
     monkeypatch.setattr(trainer, "_save_training_checkpoint", lambda **kwargs: saved.append(kwargs))
     monkeypatch.setattr(
         trainer,
         "validate",
-        lambda *args, **kwargs: validation_calls.append(10) or {
-            "mIoU": 0.25, "pixel_acc": 0.5, "mAcc": 0.3
-        },
+        lambda *args, **kwargs: (
+            validation_calls.append(True)
+            or {
+                "mIoU": next(validation_results),
+                "pixel_acc": 0.5,
+                "mAcc": 0.3,
+            }
+        ),
     )
     result = trainer.run_training(config, joint_entrypoint=True)
-    assert counts == {"optimizer": 10, "scheduler": 10}
-    assert saved[0]["global_step"] == 10
-    assert saved[0]["micro_step"] == 40
-    assert result["optimizer_step"] == 10
-    assert validation_calls == [10]
+    expected_updates = max_steps - start_step
+    assert counts == {"optimizer": expected_updates, "scheduler": expected_updates}
+    best_saves = [
+        checkpoint
+        for checkpoint in saved
+        if checkpoint["filenames"] == ["best.pt"]
+    ]
+    assert [checkpoint["global_step"] for checkpoint in best_saves] == expected_best_steps
+    assert all(
+        {
+            "training_model", "optimizer", "scheduler", "scaler",
+            "micro_step", "metrics",
+        } <= checkpoint.keys()
+        for checkpoint in best_saves
+    )
+    assert all(
+        checkpoint["metrics"]["best_mIoU"]
+        == checkpoint["metrics"]["mIoU"]
+        for checkpoint in best_saves
+    )
+    assert saved[-1]["global_step"] == max_steps
+    assert saved[-1]["micro_step"] == expected_updates * 4
+    assert result["optimizer_step"] == max_steps
+    assert len(validation_calls) == len(validation_mious)
 
 
 def test_optimizer_step_validation_interval_and_final_trigger():

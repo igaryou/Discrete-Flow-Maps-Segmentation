@@ -851,11 +851,22 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
         last_metrics: dict = {"best_mIoU": state.best_miou}
         last_epoch_report: dict[str, float | int | str] = {}
         validated_optimizer_steps: set[int] = set()
+        best_checkpoint_steps: set[int] = set()
 
-        def run_validation(displayed_epoch: int, trigger: str) -> dict:
+        def run_validation(
+            displayed_epoch: int,
+            trigger: str,
+            *,
+            checkpoint_epoch: int,
+            checkpoint_micro_step: int,
+        ) -> dict:
+            previous_best = state.best_miou
             result = validate(
                 config, training_model, val_loader, context, output_dir
             )
+            is_new_best = result["mIoU"] > previous_best
+            if is_new_best:
+                state.best_miou = result["mIoU"]
             validated_optimizer_steps.add(state.global_step)
             if context.is_main_process:
                 append_jsonl(metrics_path, {
@@ -877,8 +888,31 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                         "validation/pixel_acc": result["pixel_acc"],
                         "validation/mAcc": result["mAcc"],
                     }, step=state.global_step)
-            if result["mIoU"] > state.best_miou:
-                state.best_miou = result["mIoU"]
+            if is_new_best and trigger in {
+                "optimizer_step_interval", "final_optimizer_step"
+            }:
+                checkpoint_metrics = {
+                    **result,
+                    "best_mIoU": state.best_miou,
+                    "optimizer_step": state.global_step,
+                }
+                _save_training_checkpoint(
+                    config=config,
+                    training_model=training_model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=scaler,
+                    epoch=checkpoint_epoch,
+                    global_step=state.global_step,
+                    micro_step=checkpoint_micro_step,
+                    metrics=checkpoint_metrics,
+                    context=context,
+                    output_dir=output_dir,
+                    filenames=["best.pt"],
+                    global_batch_size=global_batch_size,
+                    local_batch_size=local_batch_size,
+                )
+                best_checkpoint_steps.add(state.global_step)
             return result
 
         optimizer.zero_grad(set_to_none=True)
@@ -984,7 +1018,10 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                             and state.global_step not in validated_optimizer_steps
                         ):
                             validation_metrics = run_validation(
-                                epoch_index + 1, validation_trigger
+                                epoch_index + 1,
+                                validation_trigger,
+                                checkpoint_epoch=epoch_index,
+                                checkpoint_micro_step=total_iterations + 1,
                             )
                             validation_step = state.global_step
                     total_iterations += 1
@@ -1098,7 +1135,12 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                     "final_optimizer_step"
                     if reached_final_optimizer_step else "epoch"
                 )
-                validation_metrics = run_validation(displayed_epoch, trigger)
+                validation_metrics = run_validation(
+                    displayed_epoch,
+                    trigger,
+                    checkpoint_epoch=displayed_epoch,
+                    checkpoint_micro_step=total_iterations,
+                )
                 validation_step = state.global_step
 
             last_metrics = {
@@ -1113,6 +1155,7 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
             if (
                 validation_metrics is not None
                 and validation_step == state.global_step
+                and state.global_step not in best_checkpoint_steps
                 and validation_metrics["mIoU"] >= state.best_miou
             ):
                 filenames.append("best.pt")
