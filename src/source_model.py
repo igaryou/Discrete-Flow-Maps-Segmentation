@@ -50,6 +50,7 @@ class SegFormerSourceGenerator(nn.Module):
     def __init__(
         self, num_classes: int, variant: str, pretrained: bool, decoder_channels: int,
         freeze_encoder: bool, learned_logvar: bool, fixed_std, mu_tanh_scale: float,
+        input_already_normalized: bool = False,
     ) -> None:
         super().__init__()
         if variant not in self.MODEL_NAMES:
@@ -73,6 +74,7 @@ class SegFormerSourceGenerator(nn.Module):
         self.num_classes = num_classes
         self.fixed_std = None if learned_logvar else fixed_std
         self.mu_tanh_scale = mu_tanh_scale
+        self.input_already_normalized = input_already_normalized
         hidden_sizes = list(self.encoder.config.hidden_sizes)
         self.projections = nn.ModuleList(
             nn.Conv2d(size, decoder_channels, 1) for size in hidden_sizes
@@ -99,7 +101,7 @@ class SegFormerSourceGenerator(nn.Module):
 
     def forward(self, image: torch.Tensor):
         target_size = image.shape[-2:]
-        normalized = (
+        normalized = image if self.input_already_normalized else (
             image - self.mean.to(image)
         ) / self.std.to(image)
         hidden_states = self.encoder(
@@ -137,6 +139,7 @@ def build_source_model(config: dict):
             config["dataset"]["num_classes"], source["segformer_variant"],
             source["pretrained"], source["decoder_channels"], source["freeze_encoder"],
             source["learned_logvar"], fixed_std, source["mu_tanh_scale"],
+            source["input_already_normalized"],
         )
     if source["checkpoint"]:
         checkpoint = torch.load(source["checkpoint"], map_location="cpu", weights_only=False)
@@ -145,4 +148,3 @@ def build_source_model(config: dict):
     if source["freeze"]:
         model.requires_grad_(False)
     return model
-

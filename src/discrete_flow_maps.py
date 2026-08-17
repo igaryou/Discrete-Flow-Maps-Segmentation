@@ -124,6 +124,7 @@ def sample_prior(
     image: torch.Tensor,
     target_one_hot: torch.Tensor | None,
     source_model,
+    valid_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Sample x0 and return the CFM-compatible source losses/statistics."""
     batch, _, height, width = target_one_hot.shape if target_one_hot is not None else (
@@ -182,7 +183,14 @@ def sample_prior(
         target_norm = torch.nn.functional.normalize(
             target_one_hot.to(mu), dim=1, eps=source["align_eps"]
         )
-        loss_align = torch.nn.functional.mse_loss(mu_norm, target_norm)
+        alignment_map = (mu_norm - target_norm).square().mean(dim=1)
+        if valid_mask is None:
+            loss_align = alignment_map.mean()
+        else:
+            weights = valid_mask.to(device=mu.device, dtype=alignment_map.dtype)
+            loss_align = (
+                (alignment_map * weights).sum() / weights.sum().clamp_min(1.0)
+            )
     else:
         loss_align = zero
     sigma = torch.exp(0.5 * logvar.detach())

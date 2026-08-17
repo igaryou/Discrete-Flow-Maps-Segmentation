@@ -17,7 +17,7 @@ from checkpoint import (
     save_checkpoint,
 )
 from config import save_resolved_config
-from dataset import build_dataset
+from dataset import ade20k_eval_collate, build_dataset
 from distributed import (
     DistributedContext,
     DistributedEvalSampler,
@@ -36,7 +36,7 @@ from distributed import (
     validate_global_batch_size,
     wrap_ddp,
 )
-from inference import sample_segmentation
+from inference import sample_segmentation, terminal_state_to_original_prediction
 from metrics import SegmentationMetrics
 from model_factory import build_models
 from training_objectives import (
@@ -113,6 +113,9 @@ def _epoch_total_iterations(
     max_iterations: int | None,
     total_iterations: int,
     max_batches_per_epoch: int | None = None,
+    max_optimizer_steps: int | None = None,
+    optimizer_step: int = 0,
+    grad_accum_steps: int = 1,
 ) -> int:
     total = loader_length
     if max_iterations is not None:
@@ -120,6 +123,9 @@ def _epoch_total_iterations(
         total = min(total, remaining_iterations)
     if max_batches_per_epoch is not None:
         total = min(total, max_batches_per_epoch)
+    if max_optimizer_steps is not None:
+        remaining_updates = max(max_optimizer_steps - optimizer_step, 0)
+        total = min(total, remaining_updates * grad_accum_steps)
     return total
 
 
@@ -463,6 +469,22 @@ def build_scheduler(config: dict, optimizer):
 
     if scheduler_config["name"] == "constant":
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+    if scheduler_config["name"] == "poly":
+        maximum = config["training"]["max_optimizer_steps"]
+        warmup = scheduler_config["warmup_steps"]
+        start_factor = scheduler_config["warmup_start_factor"]
+        power = scheduler_config["power"]
+        reference_lr = float(optimizer.param_groups[0]["lr"])
+        minimum_factor = scheduler_config["min_lr"] / reference_lr
+
+        def factor(step: int) -> float:
+            if warmup > 0 and step < warmup:
+                return start_factor + (1.0 - start_factor) * step / warmup
+            denominator = max(maximum - warmup, 1)
+            progress = min(max((step - warmup) / denominator, 0.0), 1.0)
+            return max((1.0 - progress) ** power, minimum_factor)
+
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, factor)
     if scheduler_config["name"] != "cosine":
         raise ValueError(f"Unknown scheduler: {scheduler_config['name']}")
     epochs = config["training"]["epochs"]
@@ -496,7 +518,9 @@ def _build_loaders(
     context: DistributedContext,
     local_batch_size: int,
 ):
-    train_dataset = build_dataset(config, "train", augment=True)
+    train_dataset = build_dataset(
+        config, config["dataset"]["train_split"], augment=True
+    )
     val_dataset = build_dataset(config, config["evaluation"]["split"], augment=False)
     train_sampler = (
         DistributedSampler(
@@ -544,6 +568,10 @@ def _build_loaders(
         sampler=val_sampler,
         shuffle=False,
         drop_last=False,
+        collate_fn=(
+            ade20k_eval_collate
+            if config["dataset"]["name"] == "ade20k" else None
+        ),
         **common,
     )
     return train_loader, val_loader, train_sampler
@@ -563,31 +591,74 @@ def validate(
     endpoint.eval()
     if source is not None:
         source.eval()
+    eval_range = config["evaluation"]["eval_class_indices"]
+    evaluated = (
+        range(eval_range[0], eval_range[1] + 1) if eval_range is not None else None
+    )
     metrics = SegmentationMetrics(
         config["dataset"]["num_classes"],
         config["dataset"]["void_class_index"],
         device=context.device,
+        evaluated_class_indices=evaluated,
+        nanmean=config["evaluation"]["nanmean"],
     )
     visualized = 0
     maximum_batches = config["evaluation"]["max_batches"]
-    for batch_index, (image, _, target) in enumerate(loader):
+    for batch_index, batch in enumerate(loader):
         if maximum_batches is not None and batch_index >= maximum_batches:
             break
-        image = image.to(context.device, non_blocking=True)
-        target = target.to(context.device, non_blocking=True)
-        with autocast_context(config, context.device):
-            prediction = sample_segmentation(endpoint, source, image, config)
-        metrics.update(prediction, target)
+        if config["dataset"]["name"] == "ade20k":
+            visualization_items = []
+            for sample in batch:
+                image = sample["image"].unsqueeze(0).to(
+                    context.device, non_blocking=True
+                )
+                target = sample["target"].unsqueeze(0).to(
+                    context.device, non_blocking=True
+                )
+                with autocast_context(config, context.device):
+                    terminal = sample_segmentation(
+                        endpoint, source, image, config, return_terminal_state=True
+                    )
+                prediction = terminal_state_to_original_prediction(
+                    terminal,
+                    sample["model_shape"],
+                    sample["original_shape"],
+                    align_corners=config["evaluation"]["align_corners"],
+                )
+                metrics.update(prediction, target)
+                visualization_items.append((image, target, prediction))
+        else:
+            image, _, target = batch
+            image = image.to(context.device, non_blocking=True)
+            target = target.to(context.device, non_blocking=True)
+            with autocast_context(config, context.device):
+                prediction = sample_segmentation(endpoint, source, image, config)
+            metrics.update(prediction, target)
+            visualization_items = [(image, target, prediction)]
         if context.is_main_process:
             remaining = config["evaluation"]["max_visualizations"] - visualized
-            for sample_index in range(min(image.shape[0], max(remaining, 0))):
-                save_prediction(
-                    image[sample_index], target[sample_index], prediction[sample_index],
-                    output_dir / "visualizations"
-                    / f"val_{batch_index:04d}_{sample_index:02d}.png",
-                    config["augmentation"]["imagenet_normalize"],
-                )
-                visualized += 1
+            for item_index, (images, targets, predictions) in enumerate(visualization_items):
+                for sample_index in range(min(images.shape[0], max(remaining, 0))):
+                    visualization_image = images[sample_index]
+                    if visualization_image.shape[-2:] != targets[sample_index].shape:
+                        visualization_image = torch.nn.functional.interpolate(
+                            visualization_image[None].float(),
+                            size=targets[sample_index].shape,
+                            mode="bilinear",
+                            align_corners=False,
+                        )[0]
+                    save_prediction(
+                        visualization_image, targets[sample_index], predictions[sample_index],
+                        output_dir / "visualizations"
+                        / f"val_{batch_index:04d}_{item_index:02d}_{sample_index:02d}.png",
+                        (
+                            config["augmentation"]["imagenet_normalize"]
+                            or config["augmentation"]["normalize"]["enabled"]
+                        ),
+                    )
+                    visualized += 1
+                    remaining -= 1
     metrics.confusion_matrix = all_reduce_confusion_matrix(
         metrics.confusion_matrix, context
     )
@@ -629,6 +700,7 @@ def _save_training_checkpoint(
     scaler,
     epoch: int,
     global_step: int,
+    micro_step: int,
     metrics: dict,
     context: DistributedContext,
     output_dir: Path,
@@ -643,6 +715,7 @@ def _save_training_checkpoint(
             config=config,
             epoch=epoch,
             global_step=global_step,
+            micro_step=micro_step,
             model=adapter.endpoint_model,
             source_model=adapter.source_model,
             optimizer=optimizer,
@@ -700,6 +773,11 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
             global_batch_size, local_batch_size,
             config["training"]["grad_accum_steps"], effective_global_batch_size,
         )
+        logger.info("Local batch size: %d", local_batch_size)
+        logger.info("World size: %d", context.world_size)
+        logger.info("Global physical batch size: %d", global_batch_size)
+        logger.info("Gradient accumulation: %d", config["training"]["grad_accum_steps"])
+        logger.info("Effective batch size: %d", effective_global_batch_size)
         if (
             context.is_main_process
             and stage in {
@@ -721,6 +799,7 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
         adapter = DDPCompatibleTrainingModel(endpoint, source, config).to(context.device)
         optimizer = build_optimizer(config, adapter)
         max_iterations = config["training"]["max_iterations"]
+        max_optimizer_steps = config["training"]["max_optimizer_steps"]
         scheduler = build_scheduler(config, optimizer)
         scaler = build_grad_scaler(config, context.device)
         state = initialize_or_resume(
@@ -748,12 +827,17 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
         )
         operation = _operation_for_stage(stage)
         metrics_path = output_dir / "metrics.jsonl"
-        total_iterations = 0
+        total_iterations = getattr(state, "micro_step", 0)
         last_metrics: dict = {"best_mIoU": state.best_miou}
         last_epoch_report: dict[str, float | int | str] = {}
         optimizer.zero_grad(set_to_none=True)
 
         for epoch_index in range(state.start_epoch, training["epochs"]):
+            if (
+                max_optimizer_steps is not None
+                and state.global_step >= max_optimizer_steps
+            ):
+                break
             training_model.train()
             adapter = unwrap_model(training_model)
             if config["source"]["freeze"] and adapter.source_model is not None:
@@ -771,6 +855,9 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                 max_iterations,
                 total_iterations,
                 training["max_batches_per_epoch"],
+                max_optimizer_steps,
+                state.global_step,
+                training["grad_accum_steps"],
             )
             if epoch_total_iterations <= 0:
                 break
@@ -815,6 +902,7 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                                 progress_in_epoch=(
                                     batch_index / max(len(train_loader), 1)
                                 ),
+                                optimizer_step=state.global_step,
                             )
                             scaled_loss = (
                                 objectives["loss"] / training["grad_accum_steps"]
@@ -833,6 +921,8 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                         optimizer.zero_grad(set_to_none=True)
                         state.global_step += 1
                         optimizer_updates_in_epoch += 1
+                        if training["scheduler"]["step_unit"] == "optimizer_step":
+                            scheduler.step()
                     total_iterations += 1
                     processed_batches += 1
                     batch_stats = dict(objectives["stats"])
@@ -917,7 +1007,8 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                         _wandb_epoch_payload(epoch_report, consistency_type),
                         step=state.global_step,
                     )
-            scheduler.step()
+            if training["scheduler"]["step_unit"] == "epoch":
+                scheduler.step()
             last_epoch_report = epoch_report
 
             validation_metrics = None
@@ -967,6 +1058,7 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                 scaler=scaler,
                 epoch=epoch_index + 1,
                 global_step=state.global_step,
+                micro_step=total_iterations,
                 metrics=last_metrics,
                 context=context,
                 output_dir=output_dir,
@@ -975,6 +1067,11 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                 local_batch_size=local_batch_size,
             )
             if max_iterations is not None and total_iterations >= max_iterations:
+                break
+            if (
+                max_optimizer_steps is not None
+                and state.global_step >= max_optimizer_steps
+            ):
                 break
 
         checksum_stats = parameter_checksum(unwrap_model(training_model), context)

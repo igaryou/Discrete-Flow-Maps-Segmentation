@@ -1,8 +1,8 @@
 experiment:
-  name: dfm_cityscapes_stage2_psd_from_joint500
+  name: dfm_joint_psd_ade20k_151state
   seed: 42
-  output_dir: /home/igarashi_25/playground_2/CSDFM/DFM/results/stage2_psd_from_joint500
-  stage: consistency_distillation
+  output_dir: /home/igarashi_25/playground_2/CSDFM/DFM/results/joint_psd_ade20k
+  stage: joint_training
 runtime:
   device: auto
   amp: true
@@ -17,12 +17,17 @@ distributed:
   broadcast_buffers: false
   gradient_as_bucket_view: true
 dataset:
-  name: cityscapes
-  root: /home/igarashi_25/datasets/cityscapes
-  num_classes: 20
-  eval_num_classes: 19
-  void_class_index: 19
-  image_size: [256, 512]
+  name: ade20k
+  root: /home/igarashi_25/datasets/ADEChallengeData2016
+  num_classes: 151
+  eval_num_classes: 150
+  void_class_index: 0
+  background_index: 0
+  ignore_index: 0
+  reduce_zero_label: false
+  train_split: training
+  val_split: validation
+  image_size: [512, 512]
   crop_size: null
   num_workers: 8
   pin_memory: true
@@ -31,15 +36,41 @@ augmentation:
   enabled: true
   horizontal_flip: {enabled: true, probability: 0.5}
   color_jitter:
-    enabled: true
+    enabled: false
     brightness: 0.2
     contrast: 0.2
     saturation: 0.2
     hue: 0.1
   imagenet_normalize: false
+  random_resize:
+    enabled: true
+    base_scale: {width: 2048, height: 512}
+    ratio_range: [0.5, 2.0]
+    keep_ratio: true
+  random_crop:
+    enabled: true
+    size: [512, 512]
+    cat_max_ratio: 0.75
+    ignore_index: 0
+    max_attempts: 10
+  photometric_distortion:
+    enabled: true
+    brightness_delta: 32
+    contrast_range: [0.5, 1.5]
+    saturation_range: [0.5, 1.5]
+    hue_delta: 18
+  normalize:
+    enabled: true
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+  pad:
+    enabled: true
+    size: [512, 512]
+    image_value: 0.0
+    mask_value: 0
 model:
   backbone: unet
-  num_classes: 20
+  num_classes: 151
   fusion_channels: 128
   rrdb_blocks: 3
   rrdb_growth_channels: 32
@@ -68,6 +99,7 @@ source:
   align_weight: 0.15
   var_weight: 0.0
   align_eps: 1.0e-8
+  input_already_normalized: true
 flow:
   time_eps: 1.0e-5
   probability_eps: 1.0e-8
@@ -78,36 +110,44 @@ time_sampling:
   max_time: 1.0
   min_gap: 1.0e-5
 training:
-  epochs: 300
+  epochs: 1000
   max_iterations: null
-  batch_size: 4
-  grad_accum_steps: 1
+  max_optimizer_steps: 160000
+  max_batches_per_epoch: null
+  batch_size: 4  # global physical batch: 2 per GPU x 2 GPUs
+  grad_accum_steps: 4
   optimizer:
     name: adamw
-    lr: 3.2e-5
+    lr: 1.0e-4
     weight_decay: 1.0e-3
     betas: [0.9, 0.999]
     parameter_groups:
-      model: {lr: 3.2e-5}
-      source: {lr: 1.6e-5}
+      model: {lr: 5.0e-5}
+      source: {lr: 1.0e-5}
   scheduler:
-    name: cosine
+    name: poly
+    step_unit: optimizer_step
     warmup_epochs: 0
-    eta_min: 5.0e-7
+    warmup_steps: 1500
+    warmup_start_factor: 1.0e-6
+    power: 1.0
+    min_lr: 0.0
+    eta_min: 0.0
   grad_clip: 1.0
   label_smoothing: 0.0
   log_interval: 50
-  checkpoint_interval_epochs: 100
-  validation_epochs: [75, 150, 200, 300]
+  checkpoint_interval_epochs: 10
+  validation_epochs: [10, 20, 40, 80, 120]
 loss:
-  primary:
-    type: diagonal_ce
-    weight: 1.0
+  ignore_index: 0
+  mask_pixel_losses: true
+  primary: {type: diagonal_ce, weight: 0.5}
   consistency:
     enabled: true
     type: psd
     weight: 0.5
     start_epoch: 0
+    start: {unit: optimizer_step, value: 0}
     warmup_epochs: 0
     schedule: linear
     max_weight: 1.0
@@ -123,7 +163,7 @@ loss:
       source: discrete_flow_maps
       additional_numerical_safeguards: true
     adaptive_kl:
-      enabled: true
+      enabled: false
       c: 1.0e-6
       r: 0.5
       normalize_mean: true
@@ -131,26 +171,35 @@ loss:
     invalid_teacher:
       strategy: mask_pixel
       log_eps: 1.0e-6
-      skip_batch_threshold: 0.5
+      skip_batch_threshold: null
 checkpoint:
-  init_from: /home/igarashi_25/playground_2/CSDFM/DFM/results/esd/epoch_0500.pt
   resume: null
-  load_optimizer: false
-  load_scheduler: false
+  init_from: null
+  load_optimizer: true
+  load_scheduler: true
   strict_model: true
 evaluation:
-  split: val
-  batch_size: 4
-  num_steps: 3
+  split: validation
+  batch_size: 2  # global: local batch 1 on each of 2 GPUs
+  num_steps: 15
   sampler: flow_map
   save_predictions: true
   max_visualizations: 16
   max_batches: null
   checkpoint: null
+  resize: {width: 2048, height: 512, keep_ratio: true}
+  size_divisor: 16
+  original_resolution: true
+  interpolation: bilinear
+  align_corners: false
+  eval_class_indices: [1, 150]
+  ignore_index: 0
+  nanmean: true
+  test_time_augmentation: {enabled: false, flip: false}
 wandb:
   enabled: true
   project: DFM
-  name: dfm-stage2-psd-from-joint500-256x512
+  name: dfm-joint-psd-ade20k-151state
   entity: null
   mode: online
-  tags: [cityscapes, stage2, psd, joint500-init]
+  tags: [ade20k, 151-state, joint, psd, 160k]

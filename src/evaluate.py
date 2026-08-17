@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 
 from checkpoint import _without_module_prefix
 from config import load_config
-from dataset import build_dataset
+from dataset import ade20k_eval_collate, build_dataset
 from distributed import (
     DistributedEvalSampler,
     all_reduce_confusion_matrix,
@@ -20,7 +20,7 @@ from distributed import (
     setup_distributed,
     validate_global_batch_size,
 )
-from inference import sample_segmentation
+from inference import sample_segmentation, terminal_state_to_original_prediction
 from metrics import SegmentationMetrics
 from model_factory import build_models
 from utils import autocast_context, seed_everything
@@ -72,11 +72,21 @@ def evaluate(config: dict, checkpoint_path: str | Path) -> dict:
             num_workers=config["dataset"]["num_workers"],
             pin_memory=config["dataset"]["pin_memory"],
             worker_init_fn=seed_data_loader_worker,
+            collate_fn=(
+                ade20k_eval_collate
+                if config["dataset"]["name"] == "ade20k" else None
+            ),
         )
+        eval_range = config["evaluation"]["eval_class_indices"]
         metrics = SegmentationMetrics(
             config["dataset"]["num_classes"],
             config["dataset"]["void_class_index"],
             device=device,
+            evaluated_class_indices=(
+                range(eval_range[0], eval_range[1] + 1)
+                if eval_range is not None else None
+            ),
+            nanmean=config["evaluation"]["nanmean"],
         )
         checkpoint_stem = Path(checkpoint_path).stem
         output_dir = (
@@ -87,25 +97,55 @@ def evaluate(config: dict, checkpoint_path: str | Path) -> dict:
             output_dir.mkdir(parents=True, exist_ok=True)
         barrier(context)
         visualized = 0
-        for batch_index, (image, _, target) in enumerate(loader):
+        for batch_index, batch in enumerate(loader):
             maximum_batches = config["evaluation"]["max_batches"]
             if maximum_batches is not None and batch_index >= maximum_batches:
                 break
-            image = image.to(device, non_blocking=True)
-            target = target.to(device, non_blocking=True)
-            with autocast_context(config, device):
-                prediction = sample_segmentation(model, source_model, image, config)
-            metrics.update(prediction, target)
+            if config["dataset"]["name"] == "ade20k":
+                items = []
+                for sample in batch:
+                    image = sample["image"].unsqueeze(0).to(device, non_blocking=True)
+                    target = sample["target"].unsqueeze(0).to(device, non_blocking=True)
+                    with autocast_context(config, device):
+                        terminal = sample_segmentation(
+                            model, source_model, image, config,
+                            return_terminal_state=True,
+                        )
+                    prediction = terminal_state_to_original_prediction(
+                        terminal, sample["model_shape"], sample["original_shape"],
+                        align_corners=config["evaluation"]["align_corners"],
+                    )
+                    metrics.update(prediction, target)
+                    items.append((image, target, prediction))
+            else:
+                image, _, target = batch
+                image = image.to(device, non_blocking=True)
+                target = target.to(device, non_blocking=True)
+                with autocast_context(config, device):
+                    prediction = sample_segmentation(model, source_model, image, config)
+                metrics.update(prediction, target)
+                items = [(image, target, prediction)]
             if context.is_main_process and config["evaluation"]["save_predictions"]:
                 remaining = config["evaluation"]["max_visualizations"] - visualized
-                for index in range(min(image.shape[0], max(remaining, 0))):
-                    save_prediction(
-                        image[index], target[index], prediction[index],
-                        output_dir / "predictions"
-                        / f"{batch_index:04d}_{index:02d}.png",
-                        config["augmentation"]["imagenet_normalize"],
-                    )
-                    visualized += 1
+                for item_index, (images, targets, predictions) in enumerate(items):
+                    for index in range(min(images.shape[0], max(remaining, 0))):
+                        display_image = images[index]
+                        if display_image.shape[-2:] != targets[index].shape:
+                            display_image = torch.nn.functional.interpolate(
+                                display_image[None].float(), size=targets[index].shape,
+                                mode="bilinear", align_corners=False,
+                            )[0]
+                        save_prediction(
+                            display_image, targets[index], predictions[index],
+                            output_dir / "predictions"
+                            / f"{batch_index:04d}_{item_index:02d}_{index:02d}.png",
+                            (
+                                config["augmentation"]["imagenet_normalize"]
+                                or config["augmentation"]["normalize"]["enabled"]
+                            ),
+                        )
+                        visualized += 1
+                        remaining -= 1
         metrics.confusion_matrix = all_reduce_confusion_matrix(
             metrics.confusion_matrix, context
         )

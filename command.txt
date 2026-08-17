@@ -41,3 +41,10 @@ uv run python src/evaluate.py \
   --set evaluation.num_steps=5 \
   --set source.fixed_std=1.0
 
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+CUDA_VISIBLE_DEVICES=1,3 \
+uv run torchrun \
+  --standalone \
+  --nproc_per_node=2 \
+  src/train.py \
+  --config configs/stage2_psd_from_joint500_cityscapes.yaml

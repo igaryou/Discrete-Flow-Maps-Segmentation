@@ -37,6 +37,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "num_classes": 20,
         "eval_num_classes": 19,
         "void_class_index": 19,
+        "background_index": None,
+        "ignore_index": 19,
+        "reduce_zero_label": False,
+        "train_split": "train",
+        "val_split": "val",
         "image_size": [256, 512],
         "crop_size": None,
         "num_workers": 8,
@@ -54,6 +59,37 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "hue": 0.1,
         },
         "imagenet_normalize": False,
+        "random_resize": {
+            "enabled": False,
+            "base_scale": {"width": 2048, "height": 512},
+            "ratio_range": [0.5, 2.0],
+            "keep_ratio": True,
+        },
+        "random_crop": {
+            "enabled": False,
+            "size": [512, 512],
+            "cat_max_ratio": 0.75,
+            "ignore_index": 0,
+            "max_attempts": 10,
+        },
+        "photometric_distortion": {
+            "enabled": False,
+            "brightness_delta": 32.0,
+            "contrast_range": [0.5, 1.5],
+            "saturation_range": [0.5, 1.5],
+            "hue_delta": 18.0,
+        },
+        "normalize": {
+            "enabled": False,
+            "mean": [0.485, 0.456, 0.406],
+            "std": [0.229, 0.224, 0.225],
+        },
+        "pad": {
+            "enabled": False,
+            "size": [512, 512],
+            "image_value": 0.0,
+            "mask_value": 0,
+        },
     },
     "model": {
         "backbone": "unet",
@@ -88,6 +124,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "align_weight": 0.15,
         "var_weight": 0.0,
         "align_eps": 1.0e-8,
+        "input_already_normalized": False,
     },
     "flow": {
         "time_eps": 1.0e-5,
@@ -103,6 +140,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "training": {
         "epochs": 150,
         "max_iterations": None,
+        "max_optimizer_steps": None,
         "max_batches_per_epoch": None,
         "batch_size": 4,
         "grad_accum_steps": 1,
@@ -121,6 +159,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "warmup_epochs": 20,
             "warmup_start_factor": 0.1,
             "eta_min": 1.0e-6,
+            "warmup_steps": 0,
+            "power": 1.0,
+            "min_lr": 0.0,
             "step_unit": "epoch",
         },
         "grad_clip": 1.0,
@@ -130,12 +171,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "validation_epochs": [50, 100, 150],
     },
     "loss": {
+        "ignore_index": None,
+        "mask_pixel_losses": False,
         "primary": {"type": "diagonal_ce", "weight": 1.0},
         "consistency": {
             "enabled": False,
             "type": "esd",
             "weight": 0.0,
             "start_epoch": 0,
+            "start": {"unit": "epoch", "value": 0},
             "warmup_epochs": 0,
             "schedule": "linear",
             "max_weight": 1.0,
@@ -186,6 +230,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_visualizations": 16,
         "max_batches": None,
         "checkpoint": None,
+        "resize": {"width": 2048, "height": 512, "keep_ratio": True},
+        "size_divisor": None,
+        "original_resolution": False,
+        "interpolation": "bilinear",
+        "align_corners": False,
+        "eval_class_indices": None,
+        "ignore_index": None,
+        "nanmean": False,
+        "test_time_augmentation": {"enabled": False, "flip": False},
     },
     "wandb": {
         "enabled": True,
@@ -273,14 +326,47 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     }
     if stage not in valid_stages:
         raise ValueError(f"experiment.stage must be one of {sorted(valid_stages)}")
-    if config["dataset"]["name"] != "cityscapes":
-        raise ValueError("Only dataset.name=cityscapes is supported")
-    if config["dataset"]["num_classes"] != 20 or config["model"]["num_classes"] != 20:
-        raise ValueError("DFM Cityscapes training requires exactly 20 classes")
-    if config["dataset"]["eval_num_classes"] != 19:
-        raise ValueError("dataset.eval_num_classes must be 19")
-    if config["dataset"]["void_class_index"] != 19:
-        raise ValueError("dataset.void_class_index must be 19")
+    dataset = config["dataset"]
+    if dataset["name"] not in {"cityscapes", "ade20k"}:
+        raise ValueError("dataset.name must be cityscapes or ade20k")
+    if dataset["num_classes"] != config["model"]["num_classes"]:
+        raise ValueError("dataset.num_classes and model.num_classes must match")
+    if dataset["name"] == "cityscapes":
+        if dataset["num_classes"] != 20:
+            raise ValueError("DFM Cityscapes training requires exactly 20 classes")
+        if dataset["eval_num_classes"] != 19 or dataset["void_class_index"] != 19:
+            raise ValueError("Cityscapes requires 19 eval classes and void index 19")
+    else:
+        if dataset["num_classes"] != 151 or dataset["eval_num_classes"] != 150:
+            raise ValueError("ADE20K 151-state protocol requires 151 model and 150 eval classes")
+        if dataset["background_index"] != 0 or dataset["ignore_index"] != 0:
+            raise ValueError("ADE20K requires background_index=ignore_index=0")
+        if dataset["reduce_zero_label"] is not False:
+            raise ValueError("ADE20K 151-state protocol requires reduce_zero_label=false")
+        if config["loss"]["ignore_index"] != 0 or not config["loss"]["mask_pixel_losses"]:
+            raise ValueError("ADE20K requires loss.ignore_index=0 and mask_pixel_losses=true")
+        if dataset["void_class_index"] != 0:
+            raise ValueError("ADE20K dataset.void_class_index must be 0")
+        if config["source"]["input_already_normalized"] != config["augmentation"]["normalize"]["enabled"]:
+            raise ValueError(
+                "ADE20K source.input_already_normalized must match dataset normalization"
+            )
+        if config["evaluation"]["eval_class_indices"] != [1, 150]:
+            raise ValueError("ADE20K evaluation.eval_class_indices must be [1, 150]")
+        if config["evaluation"]["ignore_index"] != 0:
+            raise ValueError("ADE20K evaluation.ignore_index must be 0")
+        evaluation = config["evaluation"]
+        if not evaluation["original_resolution"]:
+            raise ValueError("ADE20K requires original_resolution evaluation")
+        if evaluation["interpolation"] != "bilinear" or evaluation["align_corners"]:
+            raise ValueError("ADE20K evaluation requires bilinear and align_corners=false")
+        if evaluation["test_time_augmentation"]["enabled"]:
+            raise ValueError("ADE20K main protocol requires TTA disabled")
+        crop = config["augmentation"]["random_crop"]
+        if crop["ignore_index"] != 0:
+            raise ValueError("ADE20K random_crop.ignore_index must be 0")
+        if config["augmentation"]["pad"]["mask_value"] != 0:
+            raise ValueError("ADE20K padding mask value must be 0")
     if len(config["dataset"]["image_size"]) != 2:
         raise ValueError("dataset.image_size must be [height, width]")
     if config["dataset"]["crop_size"] is not None and len(config["dataset"]["crop_size"]) != 2:
@@ -293,9 +379,20 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         and training["max_batches_per_epoch"] <= 0
     ):
         raise ValueError("training.max_batches_per_epoch must be null or positive")
+    if training["max_optimizer_steps"] is not None and training["max_optimizer_steps"] <= 0:
+        raise ValueError("training.max_optimizer_steps must be null or positive")
     scheduler = training["scheduler"]
-    if scheduler["step_unit"] != "epoch":
-        raise ValueError("training.scheduler.step_unit must be epoch")
+    if scheduler["step_unit"] not in {"epoch", "optimizer_step"}:
+        raise ValueError("training.scheduler.step_unit must be epoch or optimizer_step")
+    if scheduler["name"] not in {"constant", "cosine", "poly"}:
+        raise ValueError("training.scheduler.name must be constant, cosine, or poly")
+    if scheduler["name"] == "poly":
+        if scheduler["step_unit"] != "optimizer_step":
+            raise ValueError("poly scheduler requires step_unit=optimizer_step")
+        if training["max_optimizer_steps"] is None:
+            raise ValueError("poly scheduler requires training.max_optimizer_steps")
+        if scheduler["warmup_steps"] < 0 or scheduler["power"] <= 0:
+            raise ValueError("poly warmup_steps must be non-negative and power positive")
     if not (0.0 < scheduler["warmup_start_factor"] <= 1.0):
         raise ValueError(
             "training.scheduler.warmup_start_factor must satisfy 0 < factor <= 1"
@@ -328,6 +425,11 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     if config["checkpoint"]["init_from"] and config["checkpoint"]["resume"]:
         raise ValueError("checkpoint.init_from and checkpoint.resume are mutually exclusive")
     consistency = config["loss"]["consistency"]
+    start = consistency["start"]
+    if start["unit"] not in {"epoch", "optimizer_step"}:
+        raise ValueError("loss.consistency.start.unit must be epoch or optimizer_step")
+    if start["value"] < 0:
+        raise ValueError("loss.consistency.start.value must be non-negative")
     if consistency["type"] not in {"psd", "csd", "ecld", "esd"}:
         raise ValueError("loss.consistency.type must be psd, csd, ecld, or esd")
     if consistency["schedule"] != "linear":
@@ -384,10 +486,12 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
 
 def apply_overrides(config: dict[str, Any], overrides: Iterable[str]) -> dict[str, Any]:
     result = copy.deepcopy(config)
+    override_keys: set[str] = set()
     for override in overrides:
         if "=" not in override:
             raise ValueError(f"Override must have KEY=VALUE form: {override}")
         dotted, raw_value = override.split("=", 1)
+        override_keys.add(dotted)
         parts = dotted.split(".")
         cursor: Any = result
         for part in parts[:-1]:
@@ -397,6 +501,12 @@ def apply_overrides(config: dict[str, Any], overrides: Iterable[str]) -> dict[st
         if not isinstance(cursor, dict) or parts[-1] not in cursor:
             raise ValueError(f"Unknown override key: {dotted}")
         cursor[parts[-1]] = yaml.safe_load(raw_value)
+    if (
+        "loss.consistency.start_epoch" in override_keys
+        and not any(key.startswith("loss.consistency.start.") for key in override_keys)
+        and result["loss"]["consistency"]["start"]["unit"] == "epoch"
+    ):
+        result["loss"]["consistency"]["start"]["value"] = result["loss"]["consistency"]["start_epoch"]
     return validate_config(result)
 
 
@@ -426,6 +536,11 @@ def load_config(path: str | Path, overrides: Iterable[str] = ()) -> dict[str, An
     _validate_required(raw)
     _check_unknown(raw, DEFAULT_CONFIG)
     config = _merge(DEFAULT_CONFIG, _expand(raw))
+    if select(raw, "loss.consistency.start", None) is None:
+        config["loss"]["consistency"]["start"] = {
+            "unit": "epoch",
+            "value": config["loss"]["consistency"]["start_epoch"],
+        }
     config["runtime"]["config_path"] = str(config_path)
     return apply_overrides(validate_config(config), overrides)
 

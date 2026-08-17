@@ -27,6 +27,7 @@ def compute_model_training_objectives(
     target: torch.Tensor,
     epoch_index: int,
     progress_in_epoch: float,
+    optimizer_step: int = 0,
 ) -> dict[str, Any]:
     """Build the complete endpoint/source graph inside one composite forward."""
     if operation not in {"stage1_objectives", "stage2_objectives", "joint_objectives"}:
@@ -39,7 +40,15 @@ def compute_model_training_objectives(
     time_config = config["time_sampling"]
     batch_size = image.shape[0]
 
-    x0, source_stats = sample_prior(config, image, one_hot, source)
+    ignore_index = config["loss"].get("ignore_index")
+    valid_mask = (
+        target != ignore_index
+        if config["loss"].get("mask_pixel_losses") and ignore_index is not None
+        else None
+    )
+    x0, source_stats = sample_prior(
+        config, image, one_hot, source, valid_mask=valid_mask
+    )
     image_feat = endpoint.encode_image(image)
     zero = _zero(image)
     consistency_result = None
@@ -73,11 +82,16 @@ def compute_model_training_objectives(
             # Preserve the original Stage 2 diagonal-at-s behavior.
             diagonal_time = consistency_s
             diagonal_state = consistency_state
-        schedule_weight = losses.esd_schedule_weight(
-            epoch_index, progress_in_epoch,
-            consistency_config["start_epoch"],
-            consistency_config["warmup_epochs"],
-        )
+        start = consistency_config.get("start", {
+            "unit": "epoch", "value": consistency_config["start_epoch"]
+        })
+        if start["unit"] == "optimizer_step":
+            schedule_weight = float(optimizer_step >= start["value"])
+        else:
+            schedule_weight = losses.esd_schedule_weight(
+                epoch_index, progress_in_epoch,
+                start["value"], consistency_config["warmup_epochs"],
+            )
         effective_weight = (
             consistency_config["weight"]
             * consistency_config["max_weight"]
@@ -88,7 +102,10 @@ def compute_model_training_objectives(
         diagonal_state, image_feat, diagonal_time, diagonal_time
     )
     diagonal_loss = losses.diagonal_cross_entropy(
-        diagonal_logits, target, training["label_smoothing"]
+        diagonal_logits,
+        target,
+        training["label_smoothing"],
+        ignore_index=ignore_index if valid_mask is not None else None,
     ).float()
 
     if operation != "stage1_objectives" and effective_weight > 0.0 :
@@ -110,6 +127,7 @@ def compute_model_training_objectives(
             t=consistency_t,
             precision=consistency_config["precision"],
             config=config,
+            valid_mask=valid_mask,
         )
         consistency_loss = consistency_result.loss
     else:
@@ -146,6 +164,10 @@ def compute_model_training_objectives(
             effective_weight if consistency_config["type"] == "esd" else 0.0
         ),
         "diagonal_time_mean": diagonal_time.detach().float().mean(),
+        "valid_pixel_ratio": (
+            valid_mask.float().mean().detach()
+            if valid_mask is not None else total.new_tensor(1.0)
+        ),
     }
     for key, value in source_stats.items():
         if key not in stats and torch.is_tensor(value) and value.numel() == 1:

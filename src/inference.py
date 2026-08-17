@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 from discrete_flow_maps import flow_map, make_time_grid, sample_prior
 
@@ -13,6 +14,7 @@ def sample_segmentation(
     config: dict,
     num_steps: int | None = None,
     return_trajectory: bool = False,
+    return_terminal_state: bool = False,
 ):
     model.eval()
     if source_model is not None:
@@ -28,8 +30,29 @@ def sample_segmentation(
         probability = torch.softmax(logits.float(), dim=1).to(x.dtype)
         x = flow_map(x, probability, s, t, config["flow"]["time_eps"])
         trajectory.append(x.argmax(dim=1))
+    if return_terminal_state:
+        return x
     prediction = x.argmax(dim=1)
     if return_trajectory:
         return prediction, torch.stack(trajectory, dim=1)
     return prediction
 
+
+def terminal_state_to_original_prediction(
+    terminal_state: torch.Tensor,
+    model_shape: tuple[int, int] | list[int],
+    original_shape: tuple[int, int] | list[int],
+    *,
+    align_corners: bool = False,
+) -> torch.Tensor:
+    """Remove padding, bilinear-resize all channels, then take argmax."""
+    model_height, model_width = (int(value) for value in model_shape)
+    original_height, original_width = (int(value) for value in original_shape)
+    continuous = terminal_state[..., :model_height, :model_width].float()
+    continuous = F.interpolate(
+        continuous,
+        size=(original_height, original_width),
+        mode="bilinear",
+        align_corners=align_corners,
+    )
+    return continuous.argmax(dim=1)

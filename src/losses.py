@@ -37,10 +37,34 @@ class ESDResult:
     dtypes: dict[str, torch.dtype] = field(default_factory=dict)
 
 
+def masked_mean(loss_map: torch.Tensor, valid_mask: torch.Tensor | None) -> torch.Tensor:
+    """Average over valid pixels only, with a differentiable all-invalid zero."""
+    if valid_mask is None:
+        return loss_map.mean()
+    valid_mask = valid_mask.to(device=loss_map.device, dtype=torch.bool)
+    if valid_mask.shape != loss_map.shape:
+        raise ValueError(
+            f"valid_mask shape {tuple(valid_mask.shape)} != loss map {tuple(loss_map.shape)}"
+        )
+    weights = valid_mask.to(loss_map.dtype)
+    return (loss_map * weights).sum() / weights.sum().clamp_min(1.0)
+
+
 def diagonal_cross_entropy(
-    logits: torch.Tensor, target: torch.Tensor, label_smoothing: float = 0.0
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    label_smoothing: float = 0.0,
+    ignore_index: int | None = None,
 ) -> torch.Tensor:
-    return F.cross_entropy(logits, target, label_smoothing=label_smoothing)
+    loss_map = F.cross_entropy(
+        logits,
+        target,
+        label_smoothing=label_smoothing,
+        reduction="none",
+        ignore_index=-100 if ignore_index is None else ignore_index,
+    )
+    valid_mask = None if ignore_index is None else target != ignore_index
+    return masked_mean(loss_map, valid_mask)
 
 
 def esd_schedule_weight(
@@ -142,6 +166,7 @@ def _psd_loss(
     time_eps: float,
     probability_eps: float,
     flow: Callable = flow_map,
+    valid_mask: torch.Tensor | None = None,
 ) -> ConsistencyResult:
     if not bool(((s < u) & (u < t)).all()):
         raise ValueError("PSD requires s < u < t")
@@ -174,7 +199,8 @@ def _psd_loss(
     ).float()
     student_log_probability = F.log_softmax(student_logits, dim=1)
     student_probability = student_log_probability.exp()
-    loss = -(teacher * student_log_probability).sum(dim=1).mean().float()
+    loss_map = -(teacher * student_log_probability).sum(dim=1)
+    loss = masked_mean(loss_map, valid_mask).float()
     _finite_loss("PSD", loss)
     return ConsistencyResult(
         loss=loss,
@@ -212,6 +238,7 @@ def _csd_loss(
     probability_eps: float,
     jvp_dtype: str,
     flow: Callable = flow_map,
+    valid_mask: torch.Tensor | None = None,
 ) -> ConsistencyResult:
     target_dtype = _torch_jvp_dtype(jvp_dtype)
     s32, t32 = s.float(), t.float()
@@ -257,8 +284,9 @@ def _csd_loss(
             - teacher
             + transported
         )
-        loss = residual.square().sum(dim=1).mean().float()
-        residual_norm = residual.square().sum(dim=1).sqrt().mean()
+        residual_map = residual.square().sum(dim=1)
+        loss = masked_mean(residual_map, valid_mask).float()
+        residual_norm = masked_mean(residual_map.sqrt(), valid_mask)
     _finite_loss("CSD", loss)
     return ConsistencyResult(
         loss=loss,
@@ -298,6 +326,7 @@ def _ecld_loss(
     td_weight: float,
     time_weighting: str,
     flow: Callable = flow_map,
+    valid_mask: torch.Tensor | None = None,
 ) -> ConsistencyResult:
     target_dtype = _torch_jvp_dtype(jvp_dtype)
     s32, t32 = s.float(), t.float()
@@ -348,16 +377,19 @@ def _ecld_loss(
             temporal_weight = (1.0 - t32).clamp_min(time_eps).pow(-2)
         else:
             raise ValueError(f"Unknown ECLD time weighting: {time_weighting}")
-        endpoint_ce = (
-            endpoint_ce_map * temporal_weight[:, None, None]
-        ).mean()
+        endpoint_ce = masked_mean(
+            endpoint_ce_map * temporal_weight[:, None, None], valid_mask
+        )
         gamma = (t32 - s32) / (1.0 - s32).clamp_min(time_eps)
-        temporal_derivative = (
+        temporal_derivative_map = (
             gamma.square()[:, None, None]
             * probability_derivative.square().sum(dim=1)
-        ).mean()
+        )
+        temporal_derivative = masked_mean(temporal_derivative_map, valid_mask)
         loss = (ec_weight * endpoint_ce + td_weight * temporal_derivative).float()
-        derivative_norm = probability_derivative.square().sum(dim=1).sqrt().mean()
+        derivative_norm = masked_mean(
+            probability_derivative.square().sum(dim=1).sqrt(), valid_mask
+        )
     _finite_loss("ECLD", loss)
     return ConsistencyResult(
         loss=loss,
@@ -404,6 +436,7 @@ def _esd_loss(
     adaptive_normalize_mean: bool,
     adaptive_max_weight: float | None,
     jvp_dtype: str,
+    valid_mask: torch.Tensor | None = None,
 ) -> ConsistencyResult:
     if invalid_strategy not in {"clamp", "mask_pixel", "skip_batch"}:
         raise ValueError(f"Unknown invalid teacher strategy: {invalid_strategy}")
@@ -463,8 +496,14 @@ def _esd_loss(
         )
 
         invalid_class = ~torch.isfinite(log_arg_raw) | (log_arg_raw <= log_eps)
-        valid_pixel = torch.isfinite(log_arg_raw).all(dim=1)
-        valid_pixel &= (log_arg_raw > log_eps).all(dim=1)
+        numerical_valid_pixel = torch.isfinite(log_arg_raw).all(dim=1)
+        numerical_valid_pixel &= (log_arg_raw > log_eps).all(dim=1)
+        semantic_valid_pixel = (
+            torch.ones_like(numerical_valid_pixel)
+            if valid_mask is None
+            else valid_mask.to(device=numerical_valid_pixel.device, dtype=torch.bool)
+        )
+        valid_pixel = numerical_valid_pixel & semantic_valid_pixel
         invalid_pixel = invalid_class.any(dim=1)
         invalid_sample = invalid_pixel.flatten(1).any(dim=1)
         per_sample_ratio = invalid_class.float().flatten(1).mean(dim=1)
@@ -487,9 +526,8 @@ def _esd_loss(
             if adaptive_max_weight is not None:
                 adaptive_weight = adaptive_weight.clamp_max(adaptive_max_weight)
             normalization_mask = (
-                valid_pixel
-                if invalid_strategy == "mask_pixel"
-                else torch.ones_like(valid_pixel)
+                valid_pixel if invalid_strategy == "mask_pixel"
+                else semantic_valid_pixel
             )
             if adaptive_normalize_mean and normalization_mask.any():
                 adaptive_weight = adaptive_weight / adaptive_weight[
@@ -514,9 +552,9 @@ def _esd_loss(
         if skip_for_threshold or skip_for_strategy:
             loss = zero_with_graph
         elif invalid_strategy == "mask_pixel":
-            loss = loss_map[valid_pixel].mean() if valid_pixel.any() else zero_with_graph
+            loss = masked_mean(loss_map, valid_pixel)
         else:
-            loss = loss_map.mean()
+            loss = masked_mean(loss_map, semantic_valid_pixel)
         loss = loss.float()
         entropy = -(
             teacher_probability
@@ -596,6 +634,7 @@ def compute_consistency_loss(
     flow: Callable = flow_map,
     precision: dict | None = None,
     config: dict | None = None,
+    valid_mask: torch.Tensor | None = None,
 ) -> ConsistencyResult:
     if loss_type not in {"psd", "csd", "ecld", "esd"}:
         raise ValueError(f"Unknown consistency loss: {loss_type}")
@@ -623,12 +662,13 @@ def compute_consistency_loss(
             model=model, x_s=x_s, image=image, image_feat=image_feat,
             s=s, u=u, t=t,
             time_eps=time_eps, probability_eps=probability_eps, flow=flow,
+            valid_mask=valid_mask,
         )
     elif loss_type == "csd":
         result = _csd_loss(
             model=model, x_s=x_s, image=image, image_feat=image_feat, s=s, t=t,
             time_eps=time_eps, probability_eps=probability_eps,
-            jvp_dtype=jvp_dtype, flow=flow,
+            jvp_dtype=jvp_dtype, flow=flow, valid_mask=valid_mask,
         )
     elif loss_type == "ecld":
         ecld = consistency.get("ecld", {})
@@ -639,7 +679,7 @@ def compute_consistency_loss(
             ec_weight=float(ecld.get("ec_weight", 4.0)),
             td_weight=float(ecld.get("td_weight", 2.0)),
             time_weighting=ecld.get("time_weighting", "none"),
-            flow=flow,
+            flow=flow, valid_mask=valid_mask,
         )
     else:
         invalid = consistency.get("invalid_teacher", {})
@@ -655,7 +695,7 @@ def compute_consistency_loss(
             adaptive_r=float(adaptive.get("r", 0.5)),
             adaptive_normalize_mean=bool(adaptive.get("normalize_mean", True)),
             adaptive_max_weight=adaptive.get("max_weight", 100.0),
-            jvp_dtype=jvp_dtype,
+            jvp_dtype=jvp_dtype, valid_mask=valid_mask,
         )
     if precision.get("debug_assertions", False):
         expected = None if loss_type == "psd" else _torch_jvp_dtype(jvp_dtype)
