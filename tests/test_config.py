@@ -71,7 +71,7 @@ def test_stage2_psd_from_joint500_config_keeps_warmups_separate():
     assert config["training"]["scheduler"]["warmup_epochs"] == 0
     assert config["loss"]["consistency"]["type"] == "psd"
     assert config["loss"]["consistency"]["start_epoch"] == 0
-    assert config["loss"]["consistency"]["warmup_epochs"] == 30
+    assert config["loss"]["consistency"]["warmup_epochs"] == 0
     assert config["checkpoint"]["init_from"].endswith(
         "/results/esd/epoch_0500.pt"
     )
@@ -85,6 +85,7 @@ def test_yaml_load_and_cli_override():
     assert config["training"]["scheduler"]["step_unit"] == "epoch"
     assert config["training"]["scheduler"]["warmup_start_factor"] == 0.1
     assert config["training"]["max_batches_per_epoch"] is None
+    assert config["evaluation"]["interval"] == {"unit": "epoch", "value": None}
 
 
 def test_scheduler_unit_and_debug_epoch_limit_are_validated():

@@ -129,6 +129,26 @@ def _epoch_total_iterations(
     return total
 
 
+def _optimizer_step_validation_trigger(
+    config: dict, global_step: int
+) -> str | None:
+    max_optimizer_steps = config["training"]["max_optimizer_steps"]
+    if (
+        max_optimizer_steps is not None
+        and global_step >= max_optimizer_steps
+    ):
+        return "final_optimizer_step"
+    interval = config["evaluation"]["interval"]
+    if (
+        interval["unit"] == "optimizer_step"
+        and interval["value"] is not None
+        and global_step > 0
+        and global_step % interval["value"] == 0
+    ):
+        return "optimizer_step_interval"
+    return None
+
+
 def _numbered_checkpoint_epochs(
     *,
     total_epochs: int,
@@ -830,6 +850,37 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
         total_iterations = getattr(state, "micro_step", 0)
         last_metrics: dict = {"best_mIoU": state.best_miou}
         last_epoch_report: dict[str, float | int | str] = {}
+        validated_optimizer_steps: set[int] = set()
+
+        def run_validation(displayed_epoch: int, trigger: str) -> dict:
+            result = validate(
+                config, training_model, val_loader, context, output_dir
+            )
+            validated_optimizer_steps.add(state.global_step)
+            if context.is_main_process:
+                append_jsonl(metrics_path, {
+                    "scope": "validation",
+                    "epoch": displayed_epoch,
+                    "optimizer_step": state.global_step,
+                    "trigger": trigger,
+                    **result,
+                })
+                logger.info(
+                    "validation epoch=%d optimizer_step=%d trigger=%s "
+                    "mIoU=%.6g pixel_acc=%.6g mAcc=%.6g",
+                    displayed_epoch, state.global_step, trigger,
+                    result["mIoU"], result["pixel_acc"], result["mAcc"],
+                )
+                if wandb_run is not None:
+                    wandb_run.log({
+                        "validation/mIoU": result["mIoU"],
+                        "validation/pixel_acc": result["pixel_acc"],
+                        "validation/mAcc": result["mAcc"],
+                    }, step=state.global_step)
+            if result["mIoU"] > state.best_miou:
+                state.best_miou = result["mIoU"]
+            return result
+
         optimizer.zero_grad(set_to_none=True)
 
         for epoch_index in range(state.start_epoch, training["epochs"]):
@@ -863,6 +914,8 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                 break
             processed_batches = 0
             optimizer_updates_in_epoch = 0
+            validation_metrics = None
+            validation_step = None
             epoch_start_time = time.perf_counter()
             progress = _create_epoch_progress(
                 epoch_index=epoch_index,
@@ -923,6 +976,17 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                         optimizer_updates_in_epoch += 1
                         if training["scheduler"]["step_unit"] == "optimizer_step":
                             scheduler.step()
+                        validation_trigger = _optimizer_step_validation_trigger(
+                            config, state.global_step
+                        )
+                        if (
+                            validation_trigger is not None
+                            and state.global_step not in validated_optimizer_steps
+                        ):
+                            validation_metrics = run_validation(
+                                epoch_index + 1, validation_trigger
+                            )
+                            validation_step = state.global_step
                     total_iterations += 1
                     processed_batches += 1
                     batch_stats = dict(objectives["stats"])
@@ -1011,29 +1075,31 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                 scheduler.step()
             last_epoch_report = epoch_report
 
-            validation_metrics = None
-            if epoch_index + 1 in set(training["validation_epochs"]):
-                validation_metrics = validate(
-                    config, training_model, val_loader, context, output_dir
+            displayed_epoch = epoch_index + 1
+            evaluation_interval = config["evaluation"]["interval"]
+            interval_epoch_due = (
+                evaluation_interval["unit"] == "epoch"
+                and evaluation_interval["value"] is not None
+                and displayed_epoch % evaluation_interval["value"] == 0
+            )
+            configured_epoch_due = (
+                displayed_epoch in set(training["validation_epochs"])
+                or interval_epoch_due
+            )
+            reached_final_optimizer_step = (
+                max_optimizer_steps is not None
+                and state.global_step >= max_optimizer_steps
+            )
+            if (
+                (configured_epoch_due or reached_final_optimizer_step)
+                and state.global_step not in validated_optimizer_steps
+            ):
+                trigger = (
+                    "final_optimizer_step"
+                    if reached_final_optimizer_step else "epoch"
                 )
-                if context.is_main_process:
-                    append_jsonl(metrics_path, {
-                        "scope": "validation", "epoch": epoch_index + 1,
-                        **validation_metrics,
-                    })
-                    logger.info(
-                        "validation epoch=%d mIoU=%.6g pixel_acc=%.6g mAcc=%.6g",
-                        epoch_index + 1, validation_metrics["mIoU"],
-                        validation_metrics["pixel_acc"], validation_metrics["mAcc"],
-                    )
-                    if wandb_run is not None:
-                        wandb_run.log({
-                            "validation/mIoU": validation_metrics["mIoU"],
-                            "validation/pixel_acc": validation_metrics["pixel_acc"],
-                            "validation/mAcc": validation_metrics["mAcc"],
-                        }, step=state.global_step)
-                if validation_metrics["mIoU"] > state.best_miou:
-                    state.best_miou = validation_metrics["mIoU"]
+                validation_metrics = run_validation(displayed_epoch, trigger)
+                validation_step = state.global_step
 
             last_metrics = {
                 **raw_epoch_metrics,
@@ -1042,11 +1108,11 @@ def run_training(config: dict, *, joint_entrypoint: bool = False) -> dict:
                 "best_mIoU": state.best_miou,
             }
             filenames = ["latest.pt"]
-            displayed_epoch = epoch_index + 1
             if displayed_epoch in numbered_checkpoint_epochs:
                 filenames.append(f"epoch_{epoch_index + 1:04d}.pt")
             if (
                 validation_metrics is not None
+                and validation_step == state.global_step
                 and validation_metrics["mIoU"] >= state.best_miou
             ):
                 filenames.append("best.pt")

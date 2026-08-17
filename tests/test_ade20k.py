@@ -11,12 +11,17 @@ from PIL import Image
 import trainer
 from checkpoint import checkpoint_payload, initialize_or_resume, save_checkpoint
 from config import load_config, validate_config
-from dataset import ADE20KDataset, PhotoMetricDistortion, build_dataset
+from dataset import (
+    ADE20KDataset,
+    PhotoMetricDistortion,
+    _resize_keep_ratio_size,
+    build_dataset,
+)
 from discrete_flow_maps import sample_prior
 from inference import terminal_state_to_original_prediction
 from losses import compute_consistency_loss, diagonal_cross_entropy, masked_mean
 from metrics import SegmentationMetrics
-from trainer import build_scheduler
+from trainer import _optimizer_step_validation_trigger, build_scheduler
 
 
 ROOT = Path(__file__).parents[1]
@@ -28,6 +33,47 @@ def _config():
     return load_config(ADE_CONFIG)
 
 
+@pytest.mark.parametrize(
+    ("height", "width", "expected"),
+    [
+        (500, 1000, (512, 1024)),
+        (1000, 500, (1024, 512)),
+    ],
+)
+def test_mmcv_keep_ratio_resize_semantics(height, width, expected):
+    assert _resize_keep_ratio_size(height, width, 2048, 512) == expected
+
+
+def test_train_ratio_one_resize_uses_mmcv_semantics_and_nearest_mask():
+    config = _config()
+    config["augmentation"]["random_resize"]["ratio_range"] = [1.0, 1.0]
+    dataset = object.__new__(ADE20KDataset)
+    dataset.config = config
+    image = torch.zeros(3, 1000, 500)
+    mask = torch.zeros(1000, 500, dtype=torch.long)
+    mask[:, 250:] = 150
+
+    resized_image, resized_mask = dataset._random_resize(image, mask)
+
+    assert resized_image.shape[-2:] == (1024, 512)
+    assert resized_mask.shape == (1024, 512)
+    assert set(resized_mask.unique().tolist()) == {0, 150}
+
+
+def test_validation_resize_uses_same_mmcv_semantics_and_keeps_gt_original():
+    dataset = object.__new__(ADE20KDataset)
+    dataset.config = _config()
+    dataset.images = [Path("portrait.jpg")]
+    image = torch.zeros(3, 1000, 500)
+    mask = torch.zeros(1000, 500, dtype=torch.long)
+
+    sample = dataset._validation_item(image, mask, 0)
+
+    assert sample["model_shape"] == (1024, 512)
+    assert sample["image"].shape[-2:] == (1024, 512)
+    assert sample["target"].shape == (1000, 500)
+
+
 def test_ade20k_main_config_is_151_state_and_prevents_double_normalization():
     config = _config()
     assert config["dataset"]["num_classes"] == 151
@@ -37,11 +83,18 @@ def test_ade20k_main_config_is_151_state_and_prevents_double_normalization():
     assert config["source"]["input_already_normalized"] is True
     assert config["training"]["max_optimizer_steps"] == 160000
     assert config["training"]["scheduler"]["step_unit"] == "optimizer_step"
+    assert config["evaluation"]["interval"] == {
+        "unit": "optimizer_step", "value": 16000
+    }
 
     invalid = copy.deepcopy(config)
     invalid["source"]["input_already_normalized"] = False
     with pytest.raises(ValueError, match="input_already_normalized"):
         validate_config(invalid)
+    with pytest.raises(ValueError, match="positive integer"):
+        load_config(ADE_CONFIG, ["evaluation.interval.value=0"])
+    with pytest.raises(ValueError, match="unit must be"):
+        load_config(ADE_CONFIG, ["evaluation.interval.unit=batch"])
 
 
 @pytest.mark.skipif(not ADE_ROOT.is_dir(), reason="ADE20K is not installed")
@@ -211,13 +264,16 @@ def test_terminal_state_is_bilinear_resized_before_argmax_and_after_unpadding():
     assert not bool((prediction == 2).any())
 
 
-def test_optimizer_step_budget_counts_accumulation_and_scheduler(tmp_path, monkeypatch):
+@pytest.mark.parametrize("validation_epochs", [[], [1]])
+def test_optimizer_step_budget_counts_accumulation_scheduler_and_final_validation(
+    tmp_path, monkeypatch, validation_epochs
+):
     config = _config()
     config["experiment"]["output_dir"] = str(tmp_path / "run")
     config["runtime"].update({"device": "cpu", "amp": False})
     config["training"].update({
         "epochs": 1, "max_optimizer_steps": 10, "grad_accum_steps": 4,
-        "validation_epochs": [], "checkpoint_interval_epochs": 0,
+        "validation_epochs": validation_epochs, "checkpoint_interval_epochs": 0,
     })
     config["wandb"]["enabled"] = False
     batches = [
@@ -262,6 +318,7 @@ def test_optimizer_step_budget_counts_accumulation_and_scheduler(tmp_path, monke
         }}
 
     saved = []
+    validation_calls = []
     monkeypatch.setattr(trainer, "_build_loaders", lambda *args: (batches, [], None))
     monkeypatch.setattr(trainer, "build_models", lambda *args: (endpoint, source))
     monkeypatch.setattr(trainer, "build_optimizer", counting_optimizer)
@@ -272,11 +329,27 @@ def test_optimizer_step_budget_counts_accumulation_and_scheduler(tmp_path, monke
         lambda *args, **kwargs: SimpleNamespace(start_epoch=0, global_step=0, micro_step=0, best_miou=float("-inf")),
     )
     monkeypatch.setattr(trainer, "_save_training_checkpoint", lambda **kwargs: saved.append(kwargs))
+    monkeypatch.setattr(
+        trainer,
+        "validate",
+        lambda *args, **kwargs: validation_calls.append(10) or {
+            "mIoU": 0.25, "pixel_acc": 0.5, "mAcc": 0.3
+        },
+    )
     result = trainer.run_training(config, joint_entrypoint=True)
     assert counts == {"optimizer": 10, "scheduler": 10}
     assert saved[0]["global_step"] == 10
     assert saved[0]["micro_step"] == 40
     assert result["optimizer_step"] == 10
+    assert validation_calls == [10]
+
+
+def test_optimizer_step_validation_interval_and_final_trigger():
+    config = _config()
+    assert _optimizer_step_validation_trigger(config, 15999) is None
+    assert _optimizer_step_validation_trigger(config, 16000) == "optimizer_step_interval"
+    assert _optimizer_step_validation_trigger(config, 32000) == "optimizer_step_interval"
+    assert _optimizer_step_validation_trigger(config, 160000) == "final_optimizer_step"
 
 
 def test_poly_scheduler_and_optimizer_step_resume_are_continuous(tmp_path):

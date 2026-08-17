@@ -33,8 +33,15 @@ def _normalize(image: torch.Tensor, config: dict) -> torch.Tensor:
 def _resize_keep_ratio_size(
     height: int, width: int, target_width: float, target_height: float
 ) -> tuple[int, int]:
-    scale = min(target_width / width, target_height / height)
-    return max(1, round(height * scale)), max(1, round(width * scale))
+    max_long_edge = max(target_width, target_height)
+    max_short_edge = min(target_width, target_height)
+    scale = min(
+        max_long_edge / max(height, width),
+        max_short_edge / min(height, width),
+    )
+    new_height = max(1, int(height * scale + 0.5))
+    new_width = max(1, int(width * scale + 0.5))
+    return new_height, new_width
 
 
 def _pad_to(

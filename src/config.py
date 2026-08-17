@@ -238,6 +238,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "eval_class_indices": None,
         "ignore_index": None,
         "nanmean": False,
+        "interval": {"unit": "epoch", "value": None},
         "test_time_augmentation": {"enabled": False, "flip": False},
     },
     "wandb": {
@@ -397,6 +398,16 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(
             "training.scheduler.warmup_start_factor must satisfy 0 < factor <= 1"
         )
+    evaluation_interval = config["evaluation"]["interval"]
+    if evaluation_interval["unit"] not in {"epoch", "optimizer_step"}:
+        raise ValueError("evaluation.interval.unit must be epoch or optimizer_step")
+    interval_value = evaluation_interval["value"]
+    if interval_value is not None and (
+        isinstance(interval_value, bool)
+        or not isinstance(interval_value, int)
+        or interval_value <= 0
+    ):
+        raise ValueError("evaluation.interval.value must be null or a positive integer")
     distributed = config["distributed"]
     if distributed["enabled"] not in {"auto", True, False}:
         raise ValueError("distributed.enabled must be auto, true, or false")
